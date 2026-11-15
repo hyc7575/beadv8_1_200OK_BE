@@ -11,6 +11,8 @@ import com.ok.refund.domain.BundleItem;
 import com.ok.refund.domain.BundleShipping;
 import com.ok.refund.domain.Refund;
 import com.ok.refund.domain.RefundStatus;
+import com.ok.refund.application.port.in.RefundResult;
+import com.ok.refund.application.port.in.RefundSagaUseCase;
 import com.ok.refund.domain.RefundStep;
 import com.ok.refund.domain.RefundStepStatus;
 import com.ok.refund.domain.RefundStepType;
@@ -109,6 +111,9 @@ class RefundWalletRequestIntegrationTest extends AbstractIntegrationTest {
     ConsumerFactory<?, ?> consumerFactory;
     @Autowired
     JsonMapper jsonMapper;
+    // 알람(#576)이 부를 환불 번호 입구(resume)를 직접 부른다
+    @Autowired
+    RefundSagaUseCase refundSagaUseCase;
 
     private MockMvc mockMvc;
 
@@ -251,6 +256,97 @@ class RefundWalletRequestIntegrationTest extends AbstractIntegrationTest {
                 .containsExactly(
                         tuple(RefundStepType.ORDER, RefundStepStatus.SUCCEEDED, null),
                         tuple(RefundStepType.WALLET, RefundStepStatus.READY, "IllegalStateException"));
+        assertThat(readMessagesOf(refundId, before)).isEmpty();
+    }
+
+    // 지갑 발행이 실패해 할 차례로 남은 환불을 같은 refundId로 다시 진행해도 지갑 줄을 새로 저장하지 않고 다시 시작한다(#616 결정 14).
+    // 예전에는 다음 단계 줄을 확인 없이 새로 저장해 (refund_id, step) 유일 제약에 걸렸다(11/15 재현)
+    @Test
+    void 지갑_발행이_실패한_환불을_다시_진행하면_지갑_줄을_다시_시작해_한_번_보낸다() throws Exception {
+        // given
+        Long refundId = requestedRefundId();
+        walletRefundRequestPort.fail();
+        approve(refundId)
+                .andExpect(status().isInternalServerError());
+        walletRefundRequestPort.clear();
+        Map<TopicPartition, Long> before = endOffsets();
+
+        // when
+        RefundResult result = refundSagaUseCase.resume(refundId);
+
+        // then: 지갑 줄은 같은 줄을 다시 시작해(시도 2번째) 결과 대기가 되고, 반환 요청은 한 건 나간다
+        assertThat(result.status()).isEqualTo("PROCESSING");
+        assertThat(refundStepPersistencePort.findAllByRefundId(refundId))
+                .extracting(RefundStep::getType, RefundStep::getStatus, RefundStep::getAttemptCount)
+                .containsExactly(
+                        tuple(RefundStepType.ORDER, RefundStepStatus.SUCCEEDED, 1),
+                        tuple(RefundStepType.WALLET, RefundStepStatus.AWAITING_RESULT, 2));
+        assertThat(readMessagesOf(refundId, before)).hasSize(1);
+    }
+
+    // 주문 반영이 실패해 주문 줄이 할 차례로 남은 환불을 다시 진행하면 주문 줄을 다시 시작하고(시도 2번째) 지갑까지 이어 간다.
+    // 예전에는 다시 진행해도 주문 줄의 시도 횟수가 오르지 않았다(#616)
+    @Test
+    void 주문_반영이_실패한_환불을_다시_진행하면_주문부터_다시_해_지갑까지_보낸다() throws Exception {
+        // given
+        Long refundId = requestedRefundId();
+        orderCancellationPort.fail();
+        approve(refundId)
+                .andExpect(status().isServiceUnavailable());
+        orderCancellationPort.clear();
+        Map<TopicPartition, Long> before = endOffsets();
+
+        // when
+        RefundResult result = refundSagaUseCase.resume(refundId);
+
+        // then
+        assertThat(result.status()).isEqualTo("PROCESSING");
+        assertThat(refundStepPersistencePort.findAllByRefundId(refundId))
+                .extracting(RefundStep::getType, RefundStep::getStatus, RefundStep::getAttemptCount)
+                .containsExactly(
+                        tuple(RefundStepType.ORDER, RefundStepStatus.SUCCEEDED, 2),
+                        tuple(RefundStepType.WALLET, RefundStepStatus.AWAITING_RESULT, 1));
+        assertThat(readMessagesOf(refundId, before)).hasSize(1);
+    }
+
+    // 지갑 결과를 기다리는 환불은 다시 진행해도 아무것도 보내지 않는다(결과 대기 시간 초과는 #577)
+    @Test
+    void 지갑_결과를_기다리는_환불을_다시_진행하면_아무것도_보내지_않는다() throws Exception {
+        // given
+        Long refundId = requestedRefundId();
+        approve(refundId)
+                .andExpect(status().isOk());
+        Map<TopicPartition, Long> before = endOffsets();
+
+        // when
+        RefundResult result = refundSagaUseCase.resume(refundId);
+
+        // then
+        assertThat(result.status()).isEqualTo("PROCESSING");
+        assertThat(refundStepPersistencePort.findAllByRefundId(refundId))
+                .extracting(RefundStep::getType, RefundStep::getStatus, RefundStep::getAttemptCount)
+                .containsExactly(
+                        tuple(RefundStepType.ORDER, RefundStepStatus.SUCCEEDED, 1),
+                        tuple(RefundStepType.WALLET, RefundStepStatus.AWAITING_RESULT, 1));
+        assertThat(readMessagesOf(refundId, before)).isEmpty();
+    }
+
+    // 단계 줄이 없는 처리 중 환불은 있을 수 없는 상태라 다시 진행하지 않는다(#616 결정 13)
+    @Test
+    void 단계_줄이_없는_처리_중_환불은_다시_진행하지_않는다() throws Exception {
+        // given: 승인까지 마친 뒤 단계 줄만 지워 옛 환불 모양으로 만든다
+        Long refundId = requestedRefundId();
+        approve(refundId)
+                .andExpect(status().isOk());
+        refundStepJpaRepository.deleteAllInBatch();
+        Map<TopicPartition, Long> before = endOffsets();
+
+        // when
+        RefundResult result = refundSagaUseCase.resume(refundId);
+
+        // then
+        assertThat(result.status()).isEqualTo("PROCESSING");
+        assertThat(refundStepPersistencePort.findAllByRefundId(refundId)).isEmpty();
         assertThat(readMessagesOf(refundId, before)).isEmpty();
     }
 
