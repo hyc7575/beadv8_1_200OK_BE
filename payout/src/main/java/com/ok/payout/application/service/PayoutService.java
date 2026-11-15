@@ -46,7 +46,6 @@ import com.ok.payout.application.port.in.PayoutVerifyResult;
 import com.ok.payout.application.port.out.SellerPayoutCreated;
 import com.ok.payout.application.port.in.PayoutUseCase;
 import com.ok.payout.application.port.out.PayoutEventPublisher;
-import com.ok.payout.application.port.out.PayoutModuleEventPublisher;
 import com.ok.payout.application.port.out.PayoutOutboxRepository;
 import com.ok.payout.application.port.out.PayoutOutboxRow;
 import lombok.RequiredArgsConstructor;
@@ -91,7 +90,6 @@ public class PayoutService implements PayoutUseCase {
     // draftStep의 판매자 1명 저장·실패 기록 (판매자마다 별도 트랜잭션, #90)
     private final PayoutSellerDraftService payoutSellerDraftService;
     private final PayoutEventPublisher payoutEventPublisher;
-    private final PayoutModuleEventPublisher payoutModuleEventPublisher;
     private final PayoutOutboxRepository payoutOutboxRepository;
     private final PayoutOutboxService payoutOutboxService;
 
@@ -586,7 +584,8 @@ public class PayoutService implements PayoutUseCase {
 
         payoutRepository.saveAll(payouts);
 
-        // 지갑 Spring 이벤트와 Kafka outbox 줄을 payout과 같은 트랜잭션에서 남겨, 확정과 함께 커밋·롤백되게 함
+        // 지갑 입금용 Kafka outbox 줄을 payout과 같은 트랜잭션에서 남겨, 확정과 함께 커밋·롤백되게 함
+        // 지갑은 Kafka로만 입금하므로(#584) 이 줄이 지갑 입금의 유일한 근거임. Kafka 발송은 커밋 뒤 publishPending이 함
         List<PayoutOutbox> outboxes = new ArrayList<>();
         for (Payout payout : payouts) {
             // 시스템 몫은 정산 테이블에만 기록하고 지갑으로 보내지 않음 (지갑 담당자와 협의 완료)
@@ -597,12 +596,6 @@ public class PayoutService implements PayoutUseCase {
             if (payout.isSystem() || payout.getAmount() <= 0) {
                 continue;
             }
-            payoutModuleEventPublisher.publishSellerPayoutCreated(new SellerPayoutCreated(
-                    payout.getId(),
-                    payout.getPayeeId(),
-                    payout.getAmount(),
-                    payout.getCreatedAt()
-            ));
             outboxes.add(PayoutOutbox.pending(payout.getId()));
         }
         payoutOutboxRepository.saveAll(outboxes);
@@ -616,7 +609,8 @@ public class PayoutService implements PayoutUseCase {
     // outbox의 PENDING 줄을 덜 시도한 줄부터 한 줄씩 Kafka로 보냄. 이전 실행에서 못 보낸 줄도 함께 보냄 (#309)
     // 이 메서드는 트랜잭션을 더 만들지 않고, 보냄·실패 기록만 줄마다 짧은 별도 트랜잭션(PayoutOutboxService)에 남김
     // 그래서 한 줄의 실패가 앞 줄의 보냄 기록을 되돌리지 않음
-    // 실패해도 멈추지 않음: 정산·지갑 입금은 이미 끝났고 남은 줄은 다음 실행이 보냄. 같은 정산이 두 번 가도 지갑은 payoutId로 막음
+    // 실패해도 멈추지 않음: 정산은 이미 끝났고 남은 줄은 다음 실행이 보냄. 같은 정산이 두 번 가도 지갑은 payoutId로 막음
+    //   단 지갑은 Kafka 메시지가 도착해야 입금하므로(#584), 못 보낸 줄의 판매자 입금은 다음 실행까지 늦어짐 (짧은 간격 재발송은 #308)
     // Kafka 발송이든 보냄·실패 기록(DB)이든 예외를 밖으로 내지 않음: 정산이 끝났는데 발송 단계 문제로 Job이 FAILED가 되지 않게
     // 단 연속으로 실패하면 브로커·DB 장애로 보고 이번 발송을 멈춤 (줄마다 최대 120초씩 기다리지 않게)
     @Override
