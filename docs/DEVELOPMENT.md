@@ -767,7 +767,7 @@ com.ok.member.member
 com.ok.member.auth
 ├── config/               JWT 서명 키 설정, 비밀번호 인코더
 ├── application/
-│   ├── port/in/          LoginUseCase, TokenReissueUseCase, RefreshTokenCleanupUseCase
+│   ├── port/in/          LoginUseCase, TokenReissueUseCase, LogoutUseCase, RefreshTokenCleanupUseCase
 │   ├── port/out/         RefreshTokenRepository, AccessTokenIssuer, MemberCredentialReader, SellerApprovalReader
 │   └── service/          LoginFacade(트랜잭션 밖 비밀번호 확인), AuthService(트랜잭션), RefreshTokenService, RefreshTokenCleanupService
 └── adapter/
@@ -1102,6 +1102,17 @@ Access Token(30분)이 만료되면 로그인 때 받은 Refresh Token으로 새
 - 재발급 요청은 Access Token 없이 보냅니다. 만료된 토큰이 붙어 있어도 무시됩니다.
 - 401의 `type`으로 다음 행동을 정합니다: `token-expired`는 재발급, `invalid-token`·`unauthorized`는 재로그인.
 - 503 `auth-key-unavailable`은 토큰 문제가 아니므로 재발급도 재로그인도 하지 않고, 토큰을 그대로 두고 잠시 후 다시 보냅니다.
+
+### 로그아웃
+
+`POST /api/v1/auth/logout`에 재발급과 같은 형식(`{"refreshToken": "..."}`)으로 보내면 그 기기의 세션(Refresh Token 행)을 지우고 204를 반환합니다.
+
+- 같은 회원이 다른 기기에서 로그인한 세션은 그대로 남습니다. 모든 기기 로그아웃은 아직 없습니다(#561 이후).
+- 없거나 만료되었거나 이미 로그아웃한 토큰이어도 204입니다. 응답으로 토큰의 유효 여부를 드러내지 않고, 같은 요청을 다시 보내도 됩니다. 형식이 틀리면 422입니다.
+- Access Token 없이 보냅니다. Access Token이 만료된 뒤에도 로그아웃할 수 있도록 공개 API로 열었고, 붙어 있어도 무시합니다.
+- 이미 발급된 Access Token은 만료(30분)까지 유효하므로 클라이언트가 두 토큰을 함께 지웁니다.
+- 진행 중인 재발급 요청이 있으면 그 응답을 기다렸다가, 응답으로 받은 **새 Refresh Token으로** 로그아웃합니다. 재발급이 실패했으면 가지고 있던 토큰으로 보냅니다.
+  옛 Refresh Token으로 보내면, 서버에서 재발급이 먼저 끝난 경우 행을 찾지 못해 새 토큰의 세션이 남습니다. 재발급 응답만 버려서는 이 세션이 끝나지 않습니다. 재발급 응답이 네트워크에서 사라진 경우처럼 클라이언트가 새 토큰을 모르는 경우는 이전 토큰을 기억해야 막을 수 있어 재사용 탐지(#562)에서 다룹니다.
 
 ### 컨트롤러에서 로그인 회원 받기
 
