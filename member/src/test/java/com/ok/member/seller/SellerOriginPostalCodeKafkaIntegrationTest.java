@@ -42,7 +42,7 @@ import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
 import static org.assertj.core.api.SoftAssertions.assertSoftly;
 
-// 통합 테스트: 판매자 프로필 등록·수정으로 출고지 우편번호가 바뀌면 회원 outbox에 줄이 남고, 발송 작업이 실제 Kafka 토픽에
+// 통합 테스트: 판매자 승인과 프로필 등록·수정 때 출고지 우편번호가 회원 outbox에 줄로 남고, 발송 작업이 실제 Kafka 토픽에
 // delivery와 약속한 모양(sellerId, postalCode, occurredAt)으로 sellerId를 키로 보내는지 확인한다 (#587)
 // - 발송 스케줄러는 테스트에서 꺼져 있어(module-test.yml) 발송 유스케이스를 직접 부른다
 // - 다른 테스트의 메시지와 섞이지 않게 토픽을 키(sellerId)로 골라 센다
@@ -206,15 +206,51 @@ class SellerOriginPostalCodeKafkaIntegrationTest extends AbstractIntegrationTest
     }
 
     @Test
-    void 출고지_우편번호를_그대로_두고_수정하면_outbox_줄이_늘지_않는다() {
+    void 두_탭이_동시에_저장할_때_나중_쪽이_아무것도_고치지_않았어도_409로_막아_옛_우편번호를_보내지_않는다() {
+        // given: 탭 B가 출고지 37421인 프로필을 먼저 읽어 둔다
+        sellerProfileUseCase.register(sellerId, command("37421"));
+        memberOutboxRepository.deleteAllInBatch();
+        TransactionTemplate tabB = new TransactionTemplate(transactionManager);
+        TransactionTemplate tabA = new TransactionTemplate(transactionManager);
+        tabA.setPropagationBehavior(TransactionDefinition.PROPAGATION_REQUIRES_NEW);
+
+        // when & then: 탭 A가 06236으로 바꿔 커밋한 뒤, B는 읽어 둔 값 그대로 저장한다.
+        // 바뀐 칸이 없어도 저장 시각이 바뀌어 UPDATE와 버전 검사를 거친다(#651)
+        assertThatThrownBy(() -> tabB.executeWithoutResult(status -> {
+            sellerProfileRepository.findByMemberId(sellerId).orElseThrow();
+            tabA.executeWithoutResult(inner -> sellerProfileUseCase.update(sellerId, command("06236")));
+            sellerProfileUseCase.update(sellerId, command("37421"));
+        })).isInstanceOfSatisfying(RestApiException.class, e -> assertThat(e.getErrorCode())
+                .isEqualTo(SellerErrorCode.SELLER_PROFILE_CONCURRENT_MODIFICATION));
+
+        // then: B의 옛 값 37421은 outbox에 남지 않아, delivery 사본이 member와 같은 06236으로 남는다
+        List<MemberOutbox> outbox = memberOutboxRepository.findAll();
+        assertThat(outbox).hasSize(1);
+        assertSoftly(softly -> {
+            softly.assertThat(sellerProfileRepository.findByMemberId(sellerId).orElseThrow().getOriginPostalCode())
+                    .isEqualTo("06236");
+            softly.assertThat(outbox.getFirst().getPayload()).contains("\"postalCode\":\"06236\"");
+        });
+    }
+
+    @Test
+    void 출고지_우편번호를_그대로_두고_수정해도_현재_값을_다시_보낸다() {
         // given
         sellerProfileUseCase.register(sellerId, command("37421"));
+        memberOutboxRelayUseCase.relayPending(BATCH_SIZE);
 
-        // when
-        sellerProfileUseCase.update(sellerId, command("37421"));
+        // when: 상호명만 고친다
+        sellerProfileUseCase.update(sellerId, new SellerProfileCommand(
+                "청송 햇살농원 본점", "김영수", "054-873-2210", "37421", null, null));
+        memberOutboxRelayUseCase.relayPending(BATCH_SIZE);
 
-        // then
-        assertThat(memberOutboxRepository.findAll()).hasSize(1);
+        // then: 등록 때와 수정 때 모두 같은 우편번호가 나간다
+        List<String> sut = reader.readValuesFor(sellerId, READ_DURATION);
+        assertThat(sut).hasSize(2);
+        assertSoftly(softly -> {
+            softly.assertThat(sut.get(0)).contains("\"postalCode\":\"37421\"");
+            softly.assertThat(sut.get(1)).contains("\"postalCode\":\"37421\"");
+        });
     }
 
     @Test
