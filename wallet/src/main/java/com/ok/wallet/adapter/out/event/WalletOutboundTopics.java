@@ -14,6 +14,10 @@ public final class WalletOutboundTopics {
     public static final String WALLET_REFUND_FAILED = "wallet.wallet-refund-failed.v1";
     /** {@link #WALLET_REFUND_FAILED}의 옛 이름. 환불이 v1로 옮기면 지운다 */
     public static final String WALLET_REFUND_FAILED_OLD = "wallet.wallet-refund-failed";
+    /** 지갑 → 주문, 정산: 주문 결제 금액을 차감함. 키는 orderId, 값은 {@link com.ok.wallet.adapter.out.event.dto.WalletPaymentCompletedMessage} */
+    public static final String WALLET_PAYMENT_COMPLETED = "wallet.wallet-payment-completed.v1";
+    /** 지갑 → 주문: 주문 결제 금액을 차감하지 못함. 키는 orderId, 값은 {@link com.ok.wallet.adapter.out.event.dto.WalletPaymentFailedMessage} */
+    public static final String WALLET_PAYMENT_FAILED = "wallet.wallet-payment-failed.v1";
     /** 지갑 → 정산: 정산 입금 확인의 답. 키는 checkId, 값은 {@link com.ok.wallet.adapter.out.event.dto.PayoutDepositCheckedMessage} */
     public static final String PAYOUT_DEPOSIT_CHECKED = "wallet.payout-deposit-checked.v1";
     /** {@link #PAYOUT_DEPOSIT_CHECKED}의 옛 이름. 정산이 v1로 옮기면 지운다 */

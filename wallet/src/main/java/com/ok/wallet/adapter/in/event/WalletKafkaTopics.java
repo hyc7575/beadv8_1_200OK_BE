@@ -13,6 +13,9 @@ public final class WalletKafkaTopics {
     /** 환불 → 지갑: 예치금 반환 요청. 키는 orderId, 값은 {@link com.ok.wallet.adapter.in.event.dto.RefundApprovedMessage} */
     public static final String REFUND_APPROVED = "refund.refund-approved.v1";
 
+    /** 주문 → 지갑: 주문 생성(결제 요청). 키는 orderId, 값은 {@link com.ok.wallet.adapter.in.event.dto.OrderCreatedMessage}. 주문은 처음부터 버전(v1)을 붙인 이름으로만 보낸다 */
+    public static final String ORDER_CREATED = "order.order-created.v1";
+
     /** 정산 → 지갑: 정산금 입금 확인 요청 묶음. 키는 checkId, 값은 {@link com.ok.wallet.adapter.in.event.dto.PayoutDepositCheckRequestedMessage} */
     public static final String PAYOUT_DEPOSIT_CHECK_REQUESTED = "payout.payout-deposit-check-requested.v1";
 
@@ -26,6 +29,9 @@ public final class WalletKafkaTopics {
 
     /** 정산금 입금 확인 요청을 받아 원장을 읽고 답하는 리스너의 그룹 */
     public static final String DEPOSIT_CHECK_REPLY_GROUP = "wallet.deposit-check-reply";
+
+    /** 주문 생성을 받아 구매자 지갑에서 결제하는 리스너의 그룹 */
+    public static final String ORDER_PAYMENT_GROUP = "wallet.order-payment";
 
     private WalletKafkaTopics() {
     }
