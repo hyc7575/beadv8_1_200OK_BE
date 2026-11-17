@@ -46,6 +46,14 @@ app:
   s3:
     region: ${AWS_REGION}
     bucket: ${S3_BUCKET}
+  async:
+    executors:
+      # 커밋된 배송 outbox 줄을 바로 Kafka로 보내는 실행기 (DeliveryAsyncConfig, #644). 값을 정한 이유는 application-delivery.yaml에 있다
+      delivery-outbox-send:
+        type: platform
+        pool-size: ${DELIVERY_OUTBOX_SEND_POOL_SIZE:2}
+        queue-capacity: ${DELIVERY_OUTBOX_SEND_QUEUE_CAPACITY:1000}
+        thread-name-prefix: delivery-outbox-
   review-analysis:
     jev:
       base-url: https://api.typesafe.ai
