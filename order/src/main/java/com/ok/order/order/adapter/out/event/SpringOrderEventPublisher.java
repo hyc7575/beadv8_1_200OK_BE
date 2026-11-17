@@ -6,6 +6,7 @@ import com.ok.common.event.payload.PaidOrderItem;
 import com.ok.common.event.payload.PaidSellerOrder;
 import com.ok.common.event.payload.ShippingAddress;
 import com.ok.order.order.adapter.out.event.dto.OrderCreatedMessage;
+import com.ok.order.order.adapter.out.event.dto.OrderPaymentExpireRequestedMessage;
 import com.ok.order.order.adapter.out.event.dto.OrderProductConfirmedMessage;
 import com.ok.order.order.application.dto.PaidItemMessage;
 import com.ok.order.order.application.dto.PaidOrderMessage;
@@ -75,5 +76,14 @@ public class SpringOrderEventPublisher implements OrderEventPublisher {
 
         applicationEventPublisher.publishEvent(new OrderPaidEvent(
                 message.orderId(), message.buyerId(), message.paidAt(), shippingAddress, sellerOrders));
+    }
+
+    // 지갑이 Kafka로만 받는다(#656). 전환 전에 없던 메시지라 Spring 이벤트로는 보내지 않는다.
+    // 키는 orderId다. 순서는 같은 토픽 안에서만 지켜지므로 만료 요청이 주문 생성(order.order-created.v1)보다 먼저 도착할 수 있다.
+    // 그래도 지갑이 만료 실패를 먼저 기록해 두어 늦게 온 주문 생성은 차감하지 않는다
+    @Override
+    public void publishPaymentExpireRequested(Long orderId, Long buyerId, Long totalAmount) {
+        outboxRecorder.record(OrderTopics.ORDER_PAYMENT_EXPIRE_REQUESTED, String.valueOf(orderId),
+                jsonMapper.writeValueAsString(new OrderPaymentExpireRequestedMessage(orderId, buyerId, totalAmount)));
     }
 }
