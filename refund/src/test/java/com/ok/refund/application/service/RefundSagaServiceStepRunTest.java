@@ -10,7 +10,9 @@ import com.ok.refund.application.port.out.ProductStockReleasePort;
 import com.ok.refund.application.port.out.RefundPersistencePort;
 import com.ok.refund.application.port.out.RefundStepPersistencePort;
 import com.ok.refund.application.port.out.WalletRefundRequestPort;
+import com.ok.refund.application.port.out.WalletRevertRequest;
 import com.ok.refund.domain.Refund;
+import com.ok.refund.domain.RefundStatus;
 import com.ok.refund.domain.RefundStep;
 import com.ok.refund.domain.RefundStepStatus;
 import com.ok.refund.domain.RefundStepType;
@@ -40,6 +42,7 @@ import static org.mockito.ArgumentMatchers.any;
 import static org.mockito.BDDMockito.given;
 import static org.mockito.BDDMockito.then;
 import static org.mockito.BDDMockito.willThrow;
+import static org.mockito.Mockito.atLeastOnce;
 import static org.mockito.Mockito.never;
 
 // 기록 여부와 기록한 값이 이 클래스의 요구사항이라 영속 포트에 넘긴 값을 검증한다
@@ -155,6 +158,166 @@ class RefundSagaServiceStepRunTest {
             softly.assertThat(updated.getLastReason()).isEqualTo("PRODUCT_RELEASE_REFUSED");
             softly.assertThat(updated.getNextCheckAt()).isNull();
         });
+    }
+
+    // 예: 감자를 지갑이 돌려줬는데 상품이 재고 해제를 거절했다(409). 같은 구간에서 회수 줄을 시도 중으로 만들고,
+    // 기록이 끝나면 바로 Kafka로 회수를 요청한다(#546). 부르는 쪽에는 원래 재고 실패가 그대로 올라간다
+    @Test
+    void 재고가_다시_해도_거절되면_회수_줄을_만들고_바로_회수를_요청한다() {
+        // given
+        givenRecordable(RefundStepType.PRODUCT);
+
+        // when & then
+        assertThatThrownBy(() -> sut.runStep(REFUND_ID, RefundStepType.PRODUCT, () -> {
+            throw new RestApiException(RefundErrorCode.PRODUCT_RELEASE_REFUSED);
+        })).isInstanceOfSatisfying(RestApiException.class,
+                e -> assertThat(e.getErrorCode()).isEqualTo(RefundErrorCode.PRODUCT_RELEASE_REFUSED));
+        ArgumentCaptor<RefundStep> stepCaptor = ArgumentCaptor.forClass(RefundStep.class);
+        then(refundStepPersistencePort).should().saveNew(stepCaptor.capture());
+        RefundStep revert = stepCaptor.getValue();
+        assertThat(revert).isNotNull();
+        assertSoftly(softly -> {
+            softly.assertThat(revert.getRefundId()).isEqualTo(REFUND_ID);
+            softly.assertThat(revert.getType()).isEqualTo(RefundStepType.WALLET_REVERT);
+            softly.assertThat(revert.getStatus()).isEqualTo(RefundStepStatus.IN_PROGRESS);
+            softly.assertThat(revert.getAttemptCount()).isEqualTo(1);
+        });
+        ArgumentCaptor<WalletRevertRequest> requestCaptor = ArgumentCaptor.forClass(WalletRevertRequest.class);
+        then(walletRefundRequestPort).should().requestRevert(requestCaptor.capture());
+        assertThat(requestCaptor.getValue().refundId()).isEqualTo(REFUND_ID);
+    }
+
+    // 바로 보내기가 실패해도(Kafka 장애) 부르는 쪽에는 원래 재고 실패를 올리고, 회수 줄은 할 차례로 남아 알람이 다시 보낸다
+    @Test
+    void 회수_요청을_바로_보내지_못하면_회수_줄을_할_차례로_남기고_원래_재고_실패를_올린다() {
+        // given: 처음 조회(회수 줄 있나?)에는 없고, 보낸 뒤 실패를 기록할 때는 방금 만든 시도 중 줄이 있다
+        givenProcessingRefund();
+        given(refundStepPersistencePort.findByRefundIdAndType(REFUND_ID, RefundStepType.PRODUCT))
+                .willReturn(Optional.of(RefundStep.start(REFUND_ID, RefundStepType.PRODUCT, NOW.minusMinutes(5))));
+        given(refundStepPersistencePort.findByRefundIdAndType(REFUND_ID, RefundStepType.WALLET_REVERT))
+                .willReturn(Optional.empty(), Optional.of(RefundStep.start(REFUND_ID, RefundStepType.WALLET_REVERT, NOW)));
+        willThrow(new IllegalStateException("지갑 회수 요청 발행에 실패했습니다.")).given(walletRefundRequestPort).requestRevert(any());
+
+        // when & then
+        assertThatThrownBy(() -> sut.runStep(REFUND_ID, RefundStepType.PRODUCT, () -> {
+            throw new RestApiException(RefundErrorCode.PRODUCT_RELEASE_REFUSED);
+        })).isInstanceOfSatisfying(RestApiException.class,
+                e -> assertThat(e.getErrorCode()).isEqualTo(RefundErrorCode.PRODUCT_RELEASE_REFUSED));
+        ArgumentCaptor<RefundStep> captor = ArgumentCaptor.forClass(RefundStep.class);
+        then(refundStepPersistencePort).should(atLeastOnce()).update(captor.capture());
+        RefundStep revert = captor.getAllValues().getLast();
+        assertThat(revert).isNotNull();
+        assertSoftly(softly -> {
+            softly.assertThat(revert.getType()).isEqualTo(RefundStepType.WALLET_REVERT);
+            softly.assertThat(revert.getStatus()).isEqualTo(RefundStepStatus.READY);
+            softly.assertThat(revert.getLastReason()).isEqualTo("IllegalStateException");
+        });
+    }
+
+    // 같은 거절이 다시 기록돼도(예: 재고 줄이 다른 경로로 한 번 더 실패) 회수 줄은 하나이고 다시 보내지 않는다((refund_id, step) 유일 제약)
+    @Test
+    void 회수_줄이_이미_있으면_다시_만들지_않는다() {
+        // given
+        givenRecordable(RefundStepType.PRODUCT);
+        given(refundStepPersistencePort.findByRefundIdAndType(REFUND_ID, RefundStepType.WALLET_REVERT))
+                .willReturn(Optional.of(RefundStep.start(REFUND_ID, RefundStepType.WALLET_REVERT, NOW.minusMinutes(1))));
+
+        // when & then
+        assertThatThrownBy(() -> sut.runStep(REFUND_ID, RefundStepType.PRODUCT, () -> {
+            throw new RestApiException(RefundErrorCode.PRODUCT_RELEASE_REFUSED);
+        })).isInstanceOf(RestApiException.class);
+        then(refundStepPersistencePort).should(never()).saveNew(any());
+        then(walletRefundRequestPort).should(never()).requestRevert(any());
+    }
+
+    // 상품 404(재고 배정 기록 없음)는 다시 해도 같아 바로 멈추지만, 주소 설정 오류와 가를 수 없어 돈은 가져가지 않는다(#546 봇 리뷰, 사용자 결정)
+    @Test
+    void 재고_기록이_없다는_404는_멈추지만_회수하지_않는다() {
+        // given
+        givenRecordable(RefundStepType.PRODUCT);
+
+        // when & then
+        assertThatThrownBy(() -> sut.runStep(REFUND_ID, RefundStepType.PRODUCT, () -> {
+            throw new RestApiException(RefundErrorCode.PRODUCT_STOCK_NOT_FOUND);
+        })).isInstanceOfSatisfying(RestApiException.class,
+                e -> assertThat(e.getErrorCode()).isEqualTo(RefundErrorCode.PRODUCT_STOCK_NOT_FOUND));
+        ArgumentCaptor<RefundStep> captor = ArgumentCaptor.forClass(RefundStep.class);
+        then(refundStepPersistencePort).should().update(captor.capture());
+        RefundStep product = captor.getValue();
+        assertThat(product).isNotNull();
+        assertSoftly(softly -> {
+            softly.assertThat(product.getStatus()).isEqualTo(RefundStepStatus.STOPPED);
+            softly.assertThat(product.getLastReason()).isEqualTo("PRODUCT_STOCK_NOT_FOUND");
+        });
+        then(refundStepPersistencePort).should(never()).saveNew(any());
+        then(walletRefundRequestPort).should(never()).requestRevert(any());
+    }
+
+    // 몇 분짜리 상품 장애로 5번을 다 써 멈춘 재고는 돈을 가져가지 않는다(11/16 결정). 사람이 본다
+    @Test
+    void 재고가_시도_횟수를_다_써서_멈추면_회수하지_않는다() {
+        // given
+        givenProcessingRefund();
+        RefundStep lastTry = RefundStep.restore(3L, REFUND_ID, RefundStepType.PRODUCT, RefundStepStatus.IN_PROGRESS,
+                5, NOW.plusMinutes(1), "PRODUCT_API_FAILED", NOW.minusMinutes(5));
+        given(refundStepPersistencePort.findByRefundIdAndType(REFUND_ID, RefundStepType.PRODUCT)).willReturn(Optional.of(lastTry));
+
+        // when & then
+        assertThatThrownBy(() -> sut.runStep(REFUND_ID, RefundStepType.PRODUCT, () -> {
+            throw new RestApiException(RefundErrorCode.PRODUCT_API_FAILED);
+        })).isInstanceOf(RestApiException.class);
+        then(refundStepPersistencePort).should(never()).saveNew(any());
+    }
+
+    // 상품 422가 다섯 번째 시도에서도 와 재고 줄이 멈춰도, 이유가 회수 대상(409)이 아니라 돈은 가져가지 않는다(PR #673)
+    @Test
+    void 상품_422로_시도_횟수를_다_써서_멈춰도_회수하지_않는다() {
+        // given: 다섯 번째 시도 중인 재고 줄
+        givenProcessingRefund();
+        RefundStep lastTry = RefundStep.restore(3L, REFUND_ID, RefundStepType.PRODUCT, RefundStepStatus.IN_PROGRESS,
+                5, NOW.plusMinutes(1), "IllegalStateException", NOW.minusMinutes(5));
+        given(refundStepPersistencePort.findByRefundIdAndType(REFUND_ID, RefundStepType.PRODUCT)).willReturn(Optional.of(lastTry));
+
+        // when & then
+        assertThatThrownBy(() -> sut.runStep(REFUND_ID, RefundStepType.PRODUCT, () -> {
+            throw new IllegalStateException("상품이 422로 답함");
+        })).isInstanceOf(IllegalStateException.class);
+        ArgumentCaptor<RefundStep> captor = ArgumentCaptor.forClass(RefundStep.class);
+        then(refundStepPersistencePort).should().update(captor.capture());
+        assertThat(captor.getValue().getStatus()).isEqualTo(RefundStepStatus.STOPPED);
+        then(refundStepPersistencePort).should(never()).saveNew(any());
+        then(walletRefundRequestPort).should(never()).requestRevert(any());
+    }
+
+    // 예: 취소 금액 3,000원에서 기본 배송비 3,000원을 빼 돌려줄 돈이 0원인 환불. 재고가 409로 거절돼도 가져올 돈이 없어 회수하지 않는다
+    @Test
+    void 돌려준_돈이_0원이면_재고가_거절돼도_회수하지_않는다() {
+        // given
+        Refund zeroRefund = Refund.restore(REFUND_ID, 10L, 101L, 1, 1L, 5L, 55L, "감자", "1kg", 3_000L, 0L,
+                0L, 0L, 0L, null, RefundStatus.PROCESSING, null, null, null, null, null);
+        given(refundPersistencePort.findByIdForUpdate(REFUND_ID)).willReturn(Optional.of(zeroRefund));
+        given(refundStepPersistencePort.findByRefundIdAndType(REFUND_ID, RefundStepType.PRODUCT))
+                .willReturn(Optional.of(RefundStep.start(REFUND_ID, RefundStepType.PRODUCT, NOW.minusMinutes(5))));
+
+        // when & then
+        assertThatThrownBy(() -> sut.runStep(REFUND_ID, RefundStepType.PRODUCT, () -> {
+            throw new RestApiException(RefundErrorCode.PRODUCT_RELEASE_REFUSED);
+        })).isInstanceOf(RestApiException.class);
+        then(refundStepPersistencePort).should(never()).saveNew(any());
+        then(walletRefundRequestPort).should(never()).requestRevert(any());
+    }
+
+    // 상품 422(환불이 보낸 값 오류)는 표준 예외로 와 다시 시도한다. 회수 대상이 아니다(PR #673)
+    @Test
+    void 재고의_다시_시도할_실패는_회수하지_않는다() {
+        // given
+        givenRecordable(RefundStepType.PRODUCT);
+
+        // when & then
+        assertThatThrownBy(() -> sut.runStep(REFUND_ID, RefundStepType.PRODUCT, () -> {
+            throw new IllegalStateException("상품이 422로 답함");
+        })).isInstanceOf(IllegalStateException.class);
+        then(refundStepPersistencePort).should(never()).saveNew(any());
     }
 
     // 다시 시도할 실패라도 시도 횟수를 다 썼으면 멈춘다(#576). 사람이 보게 WARN을 남긴다

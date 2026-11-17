@@ -44,3 +44,14 @@ related: [545, 576, 616, 546, 649]
 - 결과 대기 5분과 시도 중 만료 2분은 Kafka 발행 대기(`max.block.ms` 기본 60초)를 전제로 계산했다. 팀이 `common-kafka.yaml`에 producer 상한을 두면(#649 C3) 다시 계산한다.
 - "다음 줄 없음" 규칙은 `RefundSagaPlan.fromSteps`와 `RefundStepJpaRepository.findRefundIdsNeedingAttention` 두 곳에 있다. 한쪽을 고치면 대조 테스트(`RefundStepPersistenceAdapterIntegrationTest`)가 깨지는지 본다.
 - 잠금 이름 `refundAttention`은 코드 상수와 마이그레이션 두 곳에 있다. 이름을 바꾸면 새 마이그레이션도 필요하다.
+
+## 후속 (2026-11-16)
+
+- 다시 진행할 수 없는 환불에서도 이미 보낸 줄(`awaiting_since` 있음)은 멈추지 않는다. `stopBlockedSteps`가 결과 대기로 두고 다시 볼 시각을 비운다(`RefundStep.holdForLateResult`). 멈추면 늦은 지갑 답을 기록하지 못하고, 건너뛰기만 하면 알람이 매분 다시 뽑는다(#546, PR #654 2차 봇 리뷰 1번 후속).
+
+## 후속 (2026-11-17)
+
+- 결과 대기 시간 초과의 다시 보내기에 상한을 뒀다. 처음 기다린 지 24시간(`RefundStep.RESEND_LIMIT`)이 지나면 더 보내지 않고, 멈춤으로 바꾸지 않은 채 결과 대기로 두되 다시 볼 시각을 비운다(`RefundStep.stopResendingAfterLimit`). 늦게 온 진짜 지갑 답은 계속 기록한다는 결정은 그대로다.
+- 이유: 끝없이 보내면 지갑 컨슈머가 죽어 있을 때 같은 요청이 토픽에 하루 288건씩 쌓인다(#546 봇 리뷰, 사용자 결정). 사람에게는 멈춘 환불 찾기(30분 넘게 기다림)가 이미 알린다.
+- 지갑 반환 줄과 회수 줄(#546)에 함께 적용한다. 같은 규칙이 `RefundStep` 한 곳에 있기 때문이다.
+- 이미 보낸 줄이 시도 중으로 만료돼 다시 집을 때(`RefundStep.restartExpired`)도 같은 한도를 본다. 안 보면 "결과 대기" 기록이 계속 실패할 때 2분마다 끝없이 보내 한도를 우회한다(#546 검토).

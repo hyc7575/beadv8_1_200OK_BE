@@ -37,8 +37,17 @@ public final class WalletResultPolicy {
         /** 지갑 완료를 받아 재고 단계가 시작된 환불이다. 실패나 불일치를 남기면 앞선 완료와 모순이다 */
         AFTER_WALLET_SUCCESS,
         /** 같은 이유의 실패가 이미 기록돼 있다 */
-        SAME_FAILURE
+        SAME_FAILURE,
+        /**
+         * 지갑이 "이미 다시 가져간 refundId"라 반환하지 않았다고 알렸다({@link #REFUND_REVERTED}, #546).
+         * 지갑은 회수 요청을 먼저 받으면 그 refundId를 막아 두고, 뒤에 온 반환 요청에 이 이유로 답한다.
+         * 돈은 움직이지 않았고 회수 결과는 회수 줄에 따로 오므로 지갑 실패로 남기지 않는다
+         */
+        REFUND_REVERTED
     }
+
+    /** 지갑이 막아 둔 refundId의 반환 요청에 답하는 실패 이유(PR #537 약속) */
+    public static final String REFUND_REVERTED = "REFUND_REVERTED";
 
     /**
      * 거른 결과와 넘기는 이유. 넘기지 않으면 이유는 {@code null}이다.
@@ -83,6 +92,9 @@ public final class WalletResultPolicy {
         }
         if (refund.getStatus() != RefundStatus.PROCESSING) {
             return Verdict.skip(SkipReason.NOT_PROCESSING);
+        }
+        if (kind == Kind.FAILED && REFUND_REVERTED.equals(reason)) {
+            return Verdict.skip(SkipReason.REFUND_REVERTED);
         }
         if (kind == Kind.FAILED && productStep != null) {
             return Verdict.skip(SkipReason.AFTER_WALLET_SUCCESS);

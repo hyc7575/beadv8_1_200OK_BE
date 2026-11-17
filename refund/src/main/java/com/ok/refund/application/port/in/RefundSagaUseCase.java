@@ -38,6 +38,19 @@ public interface RefundSagaUseCase {
     void recordWalletRefundFailure(WalletRefundFailedCommand command);
 
     /**
+     * 지갑이 돈을 다시 가져왔다는(회수) 결과를 회수 줄에 남긴다(#546). 환불은 처리 중으로 두고 사람이 본다(주문 되돌리기 #622 전까지).
+     * 주문·구매자·금액이 환불과 다르면 회수 줄을 {@code RESULT_MISMATCH}로 멈춘다.
+     * 없는 환불, 처리 중이 아닌 환불, 회수 줄이 없거나 이미 끝난 환불은 예외 없이 넘긴다.
+     */
+    void recordWalletRevertCompleted(WalletRevertCompletedCommand command);
+
+    /**
+     * 지갑이 돈을 다시 가져오지 못했다는 결과를 회수 줄에 멈춤으로 남긴다(#546). 주문은 되돌리지 않고 사람이 본다.
+     * 거르는 규칙은 {@link #recordWalletRevertCompleted}와 같다.
+     */
+    void recordWalletRevertFailure(WalletRevertFailedCommand command);
+
+    /**
      * 환불 번호만으로 승인 뒤 단계를 이어 간다(#616). 지휘 작업(알람, #576)이 멈춘 환불을 다시 진행할 때 쓴다.
      * 단계 줄을 보고 다음 할 일을 정해 그 단계부터 진행한다. 할 차례인 단계는 다시 시작해(시도 횟수 +1) 부른다.
      * 시도 중이거나 지갑 결과를 기다리는 중이면 아무것도 하지 않고, 단계 줄이 없거나 멈춘 단계가 있거나 처리 중이 아닌 환불이면 WARN만 남긴다.

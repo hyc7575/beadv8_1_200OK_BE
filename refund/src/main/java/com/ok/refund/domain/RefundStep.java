@@ -47,6 +47,10 @@ public class RefundStep {
     // 짧으면 정상 답을 기다리는 중에 다시 보낸다(지갑이 refundId로 걸러 돈은 한 번이지만 그 약속에만 기대게 된다)
     // TODO(#577): 설정 파일로 뺄지 정한다
     private static final Duration RESULT_WAIT = Duration.ofMinutes(5);
+    // 처음 결과를 기다리기 시작한 뒤 이 시간이 지나면 같은 요청을 더 보내지 않는다(#546 봇 리뷰, 사용자 결정 24시간).
+    // 5분마다 끝없이 보내면 지갑 컨슈머가 죽어 있을 때 토픽에 같은 요청이 쌓인다(하루 288건). 멈춤으로 바꾸지 않고 결과 대기로 두어
+    // 늦게 온 진짜 지갑 답은 계속 기록한다. 사람에게는 멈춘 환불 찾기(30분 넘게 기다림)가 이미 알리고 있다
+    static final Duration RESEND_LIMIT = Duration.ofHours(24);
 
     private final Long id;
     private final Long refundId;
@@ -175,17 +179,52 @@ public class RefundStep {
 
     /**
      * 결과를 기다리는 시각이 지난 줄을 같은 요청으로 다시 보내려고 시도 중으로 바꾼다(#577). 만료 시각은 새로 잡는다.
-     * 시도 횟수는 올리지 않고, 몇 번이 지나도 멈추지 않는다. 멈추면 끝 상태라 뒤늦게 온 진짜 지갑 답(잔액 부족 등)이 기록되지 않아
+     * 시도 횟수는 올리지 않고, 끝 상태(멈춤)로 바꾸지 않는다. 멈추면 끝 상태라 뒤늦게 온 진짜 지갑 답(잔액 부족 등)이 기록되지 않아
      * 되돌리기(#546)가 "지갑이 거절함"과 "돈이 나갔는지 모름"을 가를 수 없다. 횟수는 발행 실패·만료 다시 집기와 함께 써서,
      * 넣으면 Kafka가 잠깐 끊겼던 환불이 다시 요청도 못 하고 멈춘다. 지갑이 같은 refundId를 한 번만 처리하므로 다시 보내도 돈은 한 번만 나간다.
      * 오래 걸리는 환불은 멈춘 환불 찾기(#577)가 사람에게 알린다. 시각이 지나지 않았으면 바꾸지 않는다.
+     * 단, 처음 기다린 지 {@link #RESEND_LIMIT}가 지났으면 더 보내지 않는다({@link #stopResendingAfterLimit}이 맡는다).
      */
     public boolean resendAfterResultTimeout(LocalDateTime now) {
-        if (!isResultOverdue(now)) {
+        if (!isResultOverdue(now) || isPastResendLimit(now)) {
             return false;
         }
         status = RefundStepStatus.IN_PROGRESS;
         nextCheckAt = now.plus(IN_PROGRESS_EXPIRY);
+        return true;
+    }
+
+    /**
+     * 결과 대기 시간이 지났는데 처음 기다린 지 {@link #RESEND_LIMIT}가 넘었으면 다시 보내지 않고 늦은 결과만 기다리게 한다(#546).
+     * 결과 대기로 두고 다시 볼 시각을 비운다({@link #holdForLateResult}와 같은 모양). 알람이 더 뽑지 않고, 늦게 온 지갑 답은 기록된다.
+     * 바꿨으면 true. 시각이 지나지 않았거나 한도 안이면 바꾸지 않는다.
+     */
+    public boolean stopResendingAfterLimit(LocalDateTime now) {
+        if (!isResultOverdue(now) || !isPastResendLimit(now)) {
+            return false;
+        }
+        nextCheckAt = null;
+        return true;
+    }
+
+    // 처음 결과를 기다리기 시작한 뒤 다시 보내는 한도가 지났는지
+    private boolean isPastResendLimit(LocalDateTime now) {
+        return awaitingSince != null && !awaitingSince.plus(RESEND_LIMIT).isAfter(now);
+    }
+
+    /**
+     * 진행할 수 없는 환불에서 이미 보낸 줄을 다시 보내지 않고 늦은 결과만 기다리게 한다(#546, PR #654 리뷰).
+     * 결과 대기로 두고 다시 볼 시각을 비운다. 끝 상태가 아니라 늦게 온 지갑 답은 기록되고, 다시 볼 시각이 없어 알람이 다시 뽑지 않는다.
+     * 멈추면 늦게 온 진짜 지갑 답을 기록하지 못한다는 이유는 {@link #resendAfterResultTimeout}과 같다.
+     * 한 번도 보내지 않은 줄(awaitingSince 없음)이나 시도 중·결과 대기가 아닌 줄은 바꾸지 않는다.
+     */
+    public boolean holdForLateResult() {
+        if (awaitingSince == null
+                || (status != RefundStepStatus.AWAITING_RESULT && status != RefundStepStatus.IN_PROGRESS)) {
+            return false;
+        }
+        status = RefundStepStatus.AWAITING_RESULT;
+        nextCheckAt = null;
         return true;
     }
 
@@ -199,13 +238,20 @@ public class RefundStep {
      * 횟수를 다 썼으면 다시 집지 않고 멈춘다(이유 {@link #IN_PROGRESS_EXPIRED}). 만료되지 않았으면 다른 쪽이 하는 중이라 바꾸지 않는다.
      * 단, 이미 한 번 보내고 결과를 기다린 적 있는 줄(다시 보내는 중 서버가 죽었거나 "결과 대기" 기록이 실패함)은 횟수를 올리지 않고
      * 멈추지도 않는다(#577). 멈추면 늦게 온 진짜 지갑 답을 기록하지 못하는 이유가 {@link #failForRetry}와 같다.
-     * 다시 집었는지 멈췄는지는 바뀐 뒤 {@link #getStatus()}로 본다.
+     * 그런 줄도 처음 기다린 지 {@link #RESEND_LIMIT}가 지났으면 다시 집지 않고 결과 대기로 돌려 다시 볼 시각을 비운다(#546 검토).
+     * 이것이 없으면 "결과 대기" 기록이 계속 실패할 때 2분마다 끝없이 다시 보내 한도를 우회한다.
+     * 다시 집었는지, 멈췄는지, 늦은 결과만 기다리게 됐는지(결과 대기)는 바뀐 뒤 {@link #getStatus()}로 본다.
      */
     public boolean restartExpired(LocalDateTime now) {
         if (!isExpired(now)) {
             return false;
         }
         if (awaitingSince != null) {
+            if (isPastResendLimit(now)) {
+                status = RefundStepStatus.AWAITING_RESULT;
+                nextCheckAt = null;
+                return true;
+            }
             nextCheckAt = now.plus(IN_PROGRESS_EXPIRY);
             return true;
         }
