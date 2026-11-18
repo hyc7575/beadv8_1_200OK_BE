@@ -46,11 +46,13 @@ import org.mockito.Captor;
 import org.mockito.InjectMocks;
 import org.mockito.Mock;
 import org.mockito.junit.jupiter.MockitoExtension;
+import org.springframework.dao.DataIntegrityViolationException;
 import org.springframework.data.domain.Page;
 import org.springframework.data.domain.PageImpl;
 import org.springframework.data.domain.PageRequest;
 import org.springframework.test.util.ReflectionTestUtils;
 
+import java.sql.SQLIntegrityConstraintViolationException;
 import java.time.LocalDate;
 import java.time.LocalDateTime;
 import java.util.List;
@@ -730,13 +732,66 @@ class PayoutServiceTest {
                         e -> assertThat(e.getErrorCode()).isEqualTo(PayoutErrorCode.FEATURE_NOT_SUPPORTED));
     }
 
+    // ---------- 수동 조정 (#291) ----------
     // 관리자가 아니면 거절하는 확인은 컨트롤러 @PreAuthorize로 옮겨서 서비스 테스트에는 없음 (PayoutBlockedApiIntegrationTest에서 확인)
+    // 정상 저장·번호 발급·동시 요청은 실제 DB(UK)로 확인해야 해서 PayoutAdjustmentIntegrationTest에서 봄
+
+    // 요청 DTO가 먼저 막지만, 서비스를 다른 길로 불러도 같은 결과가 나야 함 (#291 결정 6번)
     @Test
-    void 수동_조정은_아직_지원하지_않는_기능으로_거절한다() {
+    void 배송비_조정은_서비스에서도_거절하고_저장하지_않는다() {
+        // given
+        PayoutAdjustmentCreateCommand command = new PayoutAdjustmentCreateCommand(900L, "SALE_SHIPPING_FEE", -2_000L, "배송비 정정");
+
+        // when & then
+        assertThatThrownBy(() -> sut.createAdjustment(1L, command))
+                .isInstanceOfSatisfying(RestApiException.class,
+                        e -> assertThat(e.getErrorCode()).isEqualTo(PayoutErrorCode.SHIPPING_FEE_ADJUSTMENT_NOT_SUPPORTED));
+        then(payoutCandidateItemRepository).should(never()).saveAll(any());
+    }
+
+    @Test
+    void 원래_후보가_없으면_조정을_거절하고_저장하지_않는다() {
+        // given
+        given(payoutCandidateItemRepository.findByOrderItemIdAndEventTypeAndAdjustmentId(
+                900L, PayoutEventType.SALE_AMOUNT, PayoutCandidateItem.NO_ADMIN_ADJUSTMENT_ID)).willReturn(Optional.empty());
+
         // when & then
         assertThatThrownBy(() -> sut.createAdjustment(1L, adjustmentCommand()))
                 .isInstanceOfSatisfying(RestApiException.class,
-                        e -> assertThat(e.getErrorCode()).isEqualTo(PayoutErrorCode.FEATURE_NOT_SUPPORTED));
+                        e -> assertThat(e.getErrorCode()).isEqualTo(PayoutErrorCode.ADJUSTMENT_ORIGINAL_NOT_FOUND));
+        then(payoutCandidateItemRepository).should(never()).saveAll(any());
+    }
+
+    // 재전송 막기 2겹 (#291 결정 3번): 두 요청이 같은 번호를 받아 두 번째 저장이 UK(주문상품, 종류, 조정 번호)에 걸리면 409
+    // 통합 테스트의 동시 요청은 1겹(같은 조정 있음)과 2겹 중 어느 쪽이 막았는지 실행마다 달라서, 2겹은 여기서 저장 실패를 흉내 내 확인함
+    //   실제 MySQL이 중복 키에 1062를 주는지는 PayoutFailureResolutionIntegrationTest가 확인함 (해결 API #568과 같은 방식)
+    @Test
+    void 저장이_중복_키로_실패하면_같은_조정_오류로_바꾼다() {
+        // given
+        given(payoutCandidateItemRepository.findByOrderItemIdAndEventTypeAndAdjustmentId(
+                900L, PayoutEventType.SALE_AMOUNT, PayoutCandidateItem.NO_ADMIN_ADJUSTMENT_ID))
+                .willReturn(Optional.of(PayoutCandidateItem.ofSaleAmount(100L, 900L, 7L, 9_700L)));
+        given(payoutCandidateItemRepository.saveAll(any())).willThrow(new DataIntegrityViolationException("중복 키",
+                new SQLIntegrityConstraintViolationException("Duplicate entry", "23000", 1062)));
+
+        // when & then
+        assertThatThrownBy(() -> sut.createAdjustment(1L, adjustmentCommand()))
+                .isInstanceOfSatisfying(RestApiException.class,
+                        e -> assertThat(e.getErrorCode()).isEqualTo(PayoutErrorCode.DUPLICATE_ADJUSTMENT));
+    }
+
+    // 동시 요청의 두 번째가 UK에 걸리는 경우만 409로 바꿈. 다른 무결성 오류(FK 등)는 코드 버그라 그대로 나가야 함
+    @Test
+    void 저장이_중복_키가_아닌_무결성_오류로_실패하면_같은_조정_오류로_바꾸지_않고_그대로_던진다() {
+        // given
+        given(payoutCandidateItemRepository.findByOrderItemIdAndEventTypeAndAdjustmentId(
+                900L, PayoutEventType.SALE_AMOUNT, PayoutCandidateItem.NO_ADMIN_ADJUSTMENT_ID))
+                .willReturn(Optional.of(PayoutCandidateItem.ofSaleAmount(100L, 900L, 7L, 9_700L)));
+        DataIntegrityViolationException notDuplicate = new DataIntegrityViolationException("FK 위반");
+        given(payoutCandidateItemRepository.saveAll(any())).willThrow(notDuplicate);
+
+        // when & then
+        assertThatThrownBy(() -> sut.createAdjustment(1L, adjustmentCommand())).isSameAs(notDuplicate);
     }
 
     // ---------- 정산 목록 조회 ----------
@@ -820,10 +875,10 @@ class PayoutServiceTest {
 
     @Test
     void 관리자가_판매자_정산을_보면_그_판매자_수수료와_시스템_몫_정산_ID를_함께_준다() {
-        // given: 판매자 7의 정산 12, 같은 스냅샷의 시스템 몫 정산 14에 판매자 7 수수료 1건 300원
+        // given: 판매자 7의 정산 12, 같은 스냅샷의 시스템 몫 정산 14, 정산 12가 대금을 치른 주문상품의 수수료 1건 300원
         givenDetail(sellerPayout(12L, 7L, 13_000L), 2L);
         given(payoutRepository.findBySnapshotIdAndSystemTrue(SNAPSHOT_ID)).willReturn(Optional.of(systemPayout(14L)));
-        given(payoutQueryRepository.summarizeSellerFeeItems(14L, 7L)).willReturn(new CountAndAmount(1, 300));
+        given(payoutQueryRepository.summarizeSaleFeesOfSellerPayout(12L)).willReturn(new CountAndAmount(1, 300));
 
         // when
         PayoutDetailResult result = sut.getDetailForAdmin(12L);
@@ -848,7 +903,7 @@ class PayoutServiceTest {
         // given
         givenDetail(sellerPayout(12L, 7L, 13_000L), 2L);
         given(payoutRepository.findBySnapshotIdAndSystemTrue(SNAPSHOT_ID)).willReturn(Optional.of(systemPayout(14L)));
-        given(payoutQueryRepository.summarizeSellerFeeItems(14L, 7L)).willReturn(new CountAndAmount(1, 300));
+        given(payoutQueryRepository.summarizeSaleFeesOfSellerPayout(12L)).willReturn(new CountAndAmount(1, 300));
 
         // when
         PayoutDetailResult result = sut.getDetailForSeller(7L, 12L);
@@ -880,10 +935,12 @@ class PayoutServiceTest {
     }
 
     @Test
-    void 같은_스냅샷에_시스템_몫_정산이_없으면_수수료_필드가_없다() {
-        // given: 이번 회차에 수수료가 하나도 없어서 시스템 몫 정산이 만들어지지 않음
+    void 같은_회차에_시스템_몫_정산이_없어도_앞_회차에_들어간_수수료는_합계에_준다() {
+        // given: 이번 회차에 수수료가 하나도 없어 시스템 몫 정산이 없음
+        //   보류됐던 대금이 이번에 정산되면, 그 대금의 수수료 500은 앞 회차 시스템 몫에 들어 있음 (#291)
         givenDetail(sellerPayout(12L, 7L, 13_000L), 2L);
         given(payoutRepository.findBySnapshotIdAndSystemTrue(SNAPSHOT_ID)).willReturn(Optional.empty());
+        given(payoutQueryRepository.summarizeSaleFeesOfSellerPayout(12L)).willReturn(new CountAndAmount(1, 500));
 
         // when
         PayoutDetailResult result = sut.getDetailForAdmin(12L);
@@ -892,8 +949,8 @@ class PayoutServiceTest {
         assertThat(result).isNotNull();
         assertSoftly(softly -> {
             softly.assertThat(result.systemPayoutId()).isNull();
-            softly.assertThat(result.sellerFeeAmount()).isNull();
-            softly.assertThat(result.sellerFeeItemCount()).isNull();
+            softly.assertThat(result.sellerFeeAmount()).isEqualTo(500L);
+            softly.assertThat(result.sellerFeeItemCount()).isEqualTo(1L);
         });
     }
 

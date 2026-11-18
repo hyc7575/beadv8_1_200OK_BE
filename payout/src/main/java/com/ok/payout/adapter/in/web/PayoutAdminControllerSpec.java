@@ -1,6 +1,7 @@
 package com.ok.payout.adapter.in.web;
 
 import com.ok.payout.adapter.in.web.dto.PayoutAdjustmentCreateRequest;
+import com.ok.payout.adapter.in.web.dto.PayoutAdjustmentCreateResponse;
 import com.ok.payout.adapter.in.web.dto.PayoutBlockedOrderResponse;
 import com.ok.payout.adapter.in.web.dto.PayoutBlockedOrderSearchRequest;
 import com.ok.payout.adapter.in.web.dto.PayoutCandidateResponse;
@@ -61,7 +62,10 @@ interface PayoutAdminControllerSpec {
 
     @Operation(summary = "정산 상세 조회", description = """
             정산 1건의 상세(정산 대상 기간, 항목 수)를 조회합니다. 항목 목록은 GET /api/v1/admin/payouts/{payoutId}/items로 따로 조회합니다.
-            판매자 정산이면 그 판매자 판매에서 떼어 간 수수료 합계·건수와, 그 수수료가 들어 있는 시스템 몫 정산 ID를 함께 줍니다.
+            판매자 정산이면 이 정산이 대금을 치른 주문상품에서 떼어 간 수수료 합계·건수(정산된 수수료 조정 포함, 회차와 상관없이)와, 같은 회차 시스템 몫 정산 ID를 함께 줍니다. 수수료가 없으면 0입니다.
+            0원 이하로 보류됐다가 이번에 정산된 대금의 수수료는 앞 회차 시스템 몫 정산에 있어서, 같은 회차 시스템 몫 정산에는 수수료 일부만 있을 수 있습니다.
+            그 회차에 시스템 몫 정산이 없으면 systemPayoutId만 null이고, 수수료 합계·건수는 값(없으면 0)입니다.
+            지난 정산이라도 그 주문상품의 수수료 조정이 나중 회차에 정산되면 수수료 합계·건수가 바뀝니다(예: 300 → 수수료 조정 −100 정산 뒤 200).
             시스템 몫 정산을 열면 이 세 필드는 null입니다. 그 정산이 모든 판매자 수수료를 모은 총합이라 총합은 amount·itemCount에 있고,
             판매자별 수수료는 항목 조회(GET /api/v1/admin/payouts/{payoutId}/items)의 sellerId로 확인합니다.
             """)
@@ -215,12 +219,29 @@ interface PayoutAdminControllerSpec {
             @Parameter(description = "주문 항목 ID", example = "900") Long orderItemId
     );
 
-    @Operation(summary = "정산 수동 조정 (막아 둠)", description = """
-            관리자 전용 기능이지만 조정 번호 발급 방식이 정해지지 않아 막아 두었습니다. 누가 요청해도 조정되지 않습니다.
-            로그인하지 않았으면 401, 요청 형식이 틀리면 422가 먼저이고, 형식이 맞으면 관리자는 501, 관리자가 아니면 403입니다.
+    @Operation(summary = "정산 수동 조정", description = """
+            관리자 전용입니다. 금액이 틀린 정산후보를 조정 정산후보(음수면 차감)로 바로잡습니다. 조정은 지울 수 없습니다. 잘못 넣었으면 반대 금액의 조정(사유를 다르게)을 넣어 상쇄하세요.
+            조정 번호는 서버가 그 주문 항목·종류의 마지막 번호 + 1로 붙이고, 주문·판매자는 원래 정산후보에서 가져옵니다.
+            조정은 원래 정산후보를 따라 정산됩니다. 원래가 아직 15일 대기 중이면 함께 기다리고, 이미 정산됐으면 다음 배치에 바로 들어갑니다.
+            판매자의 그 배치 합계가 0원 이하면 그 판매자는 정산하지 않고 다음 매출이 생길 때까지 보류합니다.
+
+            금액 불일치로 막힌 주문을 풀 때는 순서를 지키세요: 실패가 난 뒤 조정을 넣고, 그다음 "다시 처리"로 해결합니다.
+            이 순서로 넣은 조정만 금액 검사에 들어갑니다(원래 정산후보와 함께 정산되는 배치에서).
+            실패 전에 미리 넣었거나 해결한 뒤에 넣은 조정은 다시 해결해도 검사에 들어가지 않습니다.
+            이때는 멈춘 뒤 맞는 조정을 넣고 "다시 처리"로 해결한 다음, 해결한 뒤에 먼저 넣었던 조정의 반대 금액 조정을 넣어 상쇄하세요.
+            해결한 뒤에 넣은 조정은 검사에 섞이지 않고 지급에만 들어갑니다. 반대 조정을 해결 전에 넣으면 그것도 검사에 들어가 다시 막힙니다.
+            조정은 실제로 금액이 틀린 주문 항목에 넣으세요. 초과 청구 근거의 "넘게 만든 주문상품"은 언제부터 넘었는지 알려 줄 뿐 틀린 항목이라는 뜻이 아니니, "혼자 넘는 주문상품"·"이미 지급"과 함께 보고 고르세요.
+            같은 주문의 다른 항목에 넣어도 검사는 주문 전체 합계로 보아 통과하지만, 다른 판매자의 돈이 바뀝니다.
+            수수료(SALE_FEE) 조정은 시스템(플랫폼) 몫만 바꾸고 판매자가 받는 돈은 바꾸지 않습니다. 판매자에게 더 주거나 덜 주려면 판매 대금(SALE_AMOUNT)으로 넣으세요.
+            수수료 불일치를 풀 때는 판매 대금과 수수료를 함께 맞춰야 합니다.
+            예) 판매 40,000(대금 38,800 / 수수료 1,200)인데 결제는 30,000 → 대금 -9,700과 수수료 -300을 각각 넣습니다. 대금만 -10,000을 넣으면 수수료 불일치로 다시 막힙니다.
+
+            같은 주문 항목·종류·금액·사유의 조정이 이미 있으면 409입니다(같은 요청을 다시 보낸 경우). 일부러 한 번 더 넣으려면 사유를 다르게 적으세요.
+            로그인하지 않았으면 401, 요청 형식이 틀리면 422가 먼저이고, 관리자가 아니면 403입니다.
             조정한 관리자 ID는 요청 바디가 아니라 로그인 토큰에서 받습니다.
             """)
     @ApiResponses({
+            @ApiResponse(responseCode = "201", description = "조정을 만듦. 방금 저장한 조정 정산후보"),
             @ApiResponse(
                     responseCode = "401", description = "로그인 필요 (토큰 없음·만료·위조)",
                     content = @Content(mediaType = "application/problem+json", schema = @Schema(implementation = ProblemDetail.class))
@@ -230,11 +251,19 @@ interface PayoutAdminControllerSpec {
                     content = @Content(mediaType = "application/problem+json", schema = @Schema(implementation = ProblemDetail.class))
             ),
             @ApiResponse(
-                    responseCode = "422", description = "요청 값 검증 실패 (금액 0원, 사유 공백·255자 초과, 지원하지 않는 항목 종류 등)",
-                    content = @Content(mediaType = "application/problem+json", schema = @Schema(implementation = ProblemDetail.class))
+                    responseCode = "409", description = "같은 조정이 이미 있음 (같은 요청 재전송, 동시에 두 요청)",
+                    content = @Content(mediaType = "application/problem+json", schema = @Schema(implementation = ProblemDetail.class),
+                            examples = @ExampleObject(name = "같은 조정", value = """
+                                    {
+                                      "type": "https://api.example.com/problems/payout/duplicate-adjustment",
+                                      "title": "Duplicate adjustment",
+                                      "status": 409,
+                                      "detail": "같은 조정이 이미 있습니다. 한 번 더 넣으려면 사유를 다르게 적으세요."
+                                    }
+                                    """))
             ),
             @ApiResponse(
-                    responseCode = "501", description = "아직 지원하지 않는 기능 (관리자 요청)",
+                    responseCode = "422", description = "요청 값 검증 실패 (금액 0원, 사유 공백·255자 초과, 지원하지 않는 항목 종류·배송비), 원래 정산후보 없음",
                     content = @Content(mediaType = "application/problem+json", schema = @Schema(implementation = ProblemDetail.class))
             ),
             @ApiResponse(
@@ -242,7 +271,7 @@ interface PayoutAdminControllerSpec {
                     content = @Content(mediaType = "application/problem+json", schema = @Schema(implementation = ProblemDetail.class))
             )
     })
-    ResponseEntity<Void> createAdjustment(
+    ResponseEntity<PayoutAdjustmentCreateResponse> createAdjustment(
             @Parameter(hidden = true) Long memberId,
             PayoutAdjustmentCreateRequest request
     );
