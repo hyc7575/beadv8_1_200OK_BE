@@ -53,11 +53,11 @@ public record RefundResponse(
         @Schema(description = "구매자가 적은 취소 사유 (적었을 때만)", example = "옵션을 잘못 골랐습니다.")
         String cancelReason,
 
-        @Schema(description = "상태. REQUESTED(판매자 승인 대기), PROCESSING(승인되어 처리 중. 돌려줄 돈이 있으면 지갑이 완료를 알릴 때까지 이 상태), REJECTED(판매자 거절, 이미 출고돼 자동 거절, 승인 뒤 주문 거절), WITHDRAWN(구매자 철회), COMPLETED(주문 취소 반영·지갑 반환·재고 복구까지 마침)",
+        @Schema(description = "상태. REQUESTED(판매자 승인 대기), PROCESSING(승인되어 처리 중. 돌려줄 돈이 있으면 지갑이 완료를 알릴 때까지 이 상태), REJECTED(판매자 거절, 이미 출고돼 자동 거절, 승인 뒤 주문 거절), WITHDRAWN(구매자 철회), COMPLETED(주문 취소 반영·지갑 반환·재고 복구까지 마침), FAILED(승인 뒤 지갑 반환이나 재고 복구가 끝내 실패해 주문 취소까지 되돌림. 취소되지 않은 것으로 돌아가 상품은 원래대로 배송되고, 돌려준 돈이 있었다면 다시 가져갔다. 같은 상품을 다시 요청할 수 있다)",
                 example = "REQUESTED")
         String status,
 
-        @Schema(description = "거절 사유 (거절일 때만). 판매자가 적은 사유이거나, 승인 때 배송비가 모자라 자동 거절됐으면 그 이유",
+        @Schema(description = "거절·실패 사유 (거절·실패일 때만). 판매자가 적은 사유, 승인 때 배송비가 모자라 자동 거절된 이유, 또는 승인 뒤 처리가 실패해 취소를 되돌린 이유(FAILED)",
                 example = "이미 포장을 마쳤습니다.")
         String rejectReason,
 

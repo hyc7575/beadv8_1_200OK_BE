@@ -4,6 +4,7 @@ import com.ok.refund.application.port.in.RefundResult;
 import com.ok.refund.application.port.in.WalletRevertCompletedCommand;
 import com.ok.refund.application.port.in.WalletRevertFailedCommand;
 import com.ok.refund.application.port.out.OrderCancellationPort;
+import com.ok.refund.application.port.out.OrderRevertRequestPort;
 import com.ok.refund.application.port.out.ProductStockReleasePort;
 import com.ok.refund.application.port.out.RefundPersistencePort;
 import com.ok.refund.application.port.out.RefundStepPersistencePort;
@@ -58,13 +59,15 @@ class RefundSagaServiceWalletRevertTest {
     WalletRefundRequestPort walletRefundRequestPort;
     @Mock
     ProductStockReleasePort productStockReleasePort;
+    @Mock
+    OrderRevertRequestPort orderRevertRequestPort;
 
     RefundSagaService saga;
 
     @BeforeEach
     void setUp() {
         saga = new RefundSagaService(orderCancellationPort, walletRefundRequestPort, productStockReleasePort,
-                refundPersistencePort, refundStepPersistencePort, CLOCK, new NoOpTransactionManager());
+                orderRevertRequestPort, refundPersistencePort, refundStepPersistencePort, CLOCK, new NoOpTransactionManager());
     }
 
     // ---- 회수 요청 발행 (알람이 깨운 다시 진행) ----
@@ -180,6 +183,9 @@ class RefundSagaServiceWalletRevertTest {
             softly.assertThat(revert.getStatus()).isEqualTo(RefundStepStatus.STOPPED);
             softly.assertThat(revert.getLastReason()).isEqualTo(RefundSagaService.RESULT_MISMATCH);
         });
+        // 회수 결과를 믿을 수 없어 주문은 되돌리지 않는다(#622)
+        then(orderRevertRequestPort).should(never()).requestRevert(any());
+        then(refundStepPersistencePort).should(never()).saveNew(any());
     }
 
     // 지갑은 같은 refundId에 첫 결과를 다시 보낸다. 끝난 회수 줄은 바꾸지 않는다
