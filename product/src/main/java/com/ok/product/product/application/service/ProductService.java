@@ -6,10 +6,15 @@ import com.ok.product.product.application.port.in.SellerProductUseCase;
 import com.ok.common.exception.RestApiException;
 import com.ok.common.media.MediaUrlResolver;
 import com.ok.product.product.domain.Product;
+import com.ok.product.product.domain.ProductCategory;
 import com.ok.product.product.domain.ProductCategoryGroup;
 import com.ok.product.product.domain.ProductOptionSpec;
+import com.ok.product.product.domain.ProductRegion;
+import com.ok.product.product.domain.ProductSearchKeyword;
+import com.ok.product.product.domain.ProductSort;
 import com.ok.product.product.domain.ProductVisibility;
 import com.ok.product.product.exception.ProductErrorCode;
+import com.ok.product.product.application.port.out.BuyerProductQueryRepository;
 import com.ok.product.product.application.port.out.ProductOptionRepository;
 import com.ok.product.product.application.port.out.ProductQueryRepository;
 import com.ok.product.product.application.port.out.ProductRepository;
@@ -27,6 +32,8 @@ import com.ok.product.product.application.dto.SellerProductDetailResult;
 import com.ok.product.product.application.dto.SellerProductSearchQuery;
 import com.ok.product.product.application.dto.SellerProductSummaryResult;
 import lombok.RequiredArgsConstructor;
+import lombok.extern.slf4j.Slf4j;
+import org.springframework.dao.QueryTimeoutException;
 import org.springframework.data.domain.Page;
 import org.springframework.data.domain.PageRequest;
 import org.springframework.stereotype.Service;
@@ -36,7 +43,11 @@ import java.time.Clock;
 import java.time.LocalDateTime;
 import java.util.Arrays;
 import java.util.List;
+import java.util.Map;
+import java.util.function.Function;
+import java.util.stream.Collectors;
 
+@Slf4j
 @Service
 @RequiredArgsConstructor
 @Transactional(readOnly = true)
@@ -49,6 +60,8 @@ public class ProductService implements BuyerProductUseCase, SellerProductUseCase
 	private final ProductImageUrlValidator productImageUrlValidator;
 	private final ProductOptionRepository productOptionRepository;
 	private final ProductQueryRepository productQueryRepository;
+	private final BuyerProductQueryRepository buyerProductQueryRepository;
+	private final ProductSearchPolicy productSearchPolicy;
 	private final ProductSearchIndexer productSearchIndexer;
 	private final ProductDescriptionSanitizer descriptionSanitizer;
 	private final MediaUrlResolver mediaUrlResolver;
@@ -140,17 +153,38 @@ public class ProductService implements BuyerProductUseCase, SellerProductUseCase
 		product.delete(now());
 	}
 
-	// 구매자에게 보이는 상품 목록을 최신순으로 조회한다.
+	// 구매자에게 보이는 상품 목록을 조회한다. 정렬을 고르지 않으면 검색어가 있을 때 정확도순, 없을 때 최신순이고 품절 상품은 뒤로 간다
 	@Override
 	public Page<ProductSummaryResult> searchVisibleProducts(ProductSearchQuery query) {
-		Page<Product> products = productQueryRepository.findVisibleProducts(
-			query.categoryGroup() == null ? null : query.categoryGroup().toDomain(),
-			query.category() == null ? null : query.category().toDomain(),
-			query.region() == null ? null : query.region().toDomain(),
-			PageRequest.of(query.page(), query.size()));
-		// 품절 판정은 상세와 같은 Product.isSoldOut()을 쓴다. 옵션은 지연 로딩이지만
+		ProductCategoryGroup categoryGroup = query.categoryGroup() == null ? null : query.categoryGroup().toDomain();
+		ProductCategory category = query.category() == null ? null : query.category().toDomain();
+		ProductRegion region = query.region() == null ? null : query.region().toDomain();
+		PageRequest pageable = PageRequest.of(query.page(), query.size());
+
+		ProductSearchKeyword keyword = ProductSearchKeyword.from(query.keyword()).orElse(null);
+		ProductSort sort = ProductSort.resolve(keyword != null, query.sort() == null ? null : query.sort().toDomain());
+
+		// 검색 SQL은 순서만 정해 ID 한 페이지를 주고, 상품은 엔티티로 다시 불러온다. 응답 값을 상세와 같은 코드
+		// (Product, ProductSummaryResult)로 만들어야 카드 값이 어긋나지 않는다
+		Page<Long> productIds;
+		try {
+			productIds = buyerProductQueryRepository.findVisibleProductIds(keyword, categoryGroup, category, region, sort,
+				productSearchPolicy.minScore(), pageable);
+		} catch (QueryTimeoutException e) {
+			// RestApiException은 공통 핸들러가 로그를 남기지 않아 여기서 남긴다. 느린 조건을 찾을 수 있게 모양만 남기고,
+			// 검색어 원문은 개인정보가 섞일 수 있어 남기지 않는다
+			log.warn("상품 목록 조회가 시간 제한을 넘었습니다. keywordLength={}, sort={}, categoryGroup={}, category={}, region={}",
+				query.keyword() == null ? 0 : query.keyword().length(), sort, categoryGroup != null, category != null,
+				region != null);
+			throw new RestApiException(ProductErrorCode.PRODUCT_SEARCH_TIMEOUT);
+		}
+		Map<Long, Product> productsById = productRepository.findAllById(productIds.getContent()).stream()
+			.collect(Collectors.toMap(Product::getId, Function.identity()));
+		// 저장소는 ID 순서를 지키지 않으므로 검색 SQL이 정한 순서로 다시 맞춘다.
+		// 응답의 품절 표시는 상세와 같은 Product.isSoldOut()을 쓴다. 옵션은 지연 로딩이지만
 		// default_batch_fetch_size 덕분에 첫 접근 때 페이지 상품들의 옵션을 IN 쿼리 한 번으로 불러온다
-		return products.map(product -> ProductSummaryResult.from(product, mediaUrlResolver.toUrl(product.getThumbnailKey())));
+		return productIds.map(productsById::get)
+			.map(product -> ProductSummaryResult.from(product, mediaUrlResolver.toUrl(product.getThumbnailKey())));
 	}
 
 	// 판매자 본인의 상품 목록을 최신순으로 조회한다. 관리 화면용이라 숨긴 상품도 나오고, 삭제한 상품만 빠진다
