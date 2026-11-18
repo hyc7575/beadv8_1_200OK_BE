@@ -6,9 +6,11 @@ import com.ok.refund.application.port.out.ProductStockReleasePort;
 import com.ok.refund.application.port.out.StockRelease;
 import com.ok.refund.exception.RefundErrorCode;
 import com.ok.common.exception.RestApiException;
+import lombok.extern.slf4j.Slf4j;
 import org.springframework.beans.factory.annotation.Value;
 
 import org.springframework.stereotype.Component;
+import org.springframework.web.client.ResourceAccessException;
 import org.springframework.web.client.RestClient;
 
 import java.util.Set;
@@ -17,6 +19,7 @@ import java.util.Set;
  * 상품 모듈 내부 API를 HTTP로 불러 환불한 개수만큼 재고를 되돌린다(#363 재고 일부 해제).
  * 이름에 Refund를 붙인 이유: 다른 모듈에도 상품 호출 클라이언트가 있어, monolith에서 빈 이름이 겹치면 앱이 뜨지 않는다.
  */
+@Slf4j
 @Component
 public class RefundProductHttpAdapter implements ProductStockReleasePort {
 
@@ -49,21 +52,31 @@ public class RefundProductHttpAdapter implements ProductStockReleasePort {
     // 이유(type)는 가르지 않는다. type은 PROBLEM_BASE_URI 설정이 기본값이면 about:blank라 믿을 수 없고, 404·409 안에서는 처리가 같다
     @Override
     public void releaseStock(StockRelease release) {
-        restClient.post()
-                .uri("/stock-allocations/{orderId}/partial-release", release.orderId())
-                .body(RefundStockPartialReleaseRequest.from(release))
-                .retrieve()
-                // 메서드의 onStatus가 InternalRestClient의 기본 상태 처리보다 먼저 적용된다
-                .onStatus(status -> status.value() == REFUSED_STATUS, (request, response) -> {
-                    throw new RestApiException(RefundErrorCode.PRODUCT_RELEASE_REFUSED);
-                })
-                .onStatus(status -> status.value() == NOT_FOUND_STATUS, (request, response) -> {
-                    throw new RestApiException(RefundErrorCode.PRODUCT_STOCK_NOT_FOUND);
-                })
-                .onStatus(status -> status.value() == INVALID_REQUEST_STATUS, (request, response) -> {
-                    throw new IllegalStateException("상품이 재고 해제 요청 값을 거절함(422, 환불이 보낸 값의 오류). refundId="
-                            + release.refundId() + ", orderId=" + release.orderId());
-                })
-                .toBodilessEntity();
+        try {
+            restClient.post()
+                    .uri("/stock-allocations/{orderId}/partial-release", release.orderId())
+                    .body(RefundStockPartialReleaseRequest.from(release))
+                    .retrieve()
+                    // 메서드의 onStatus가 InternalRestClient의 기본 상태 처리보다 먼저 적용된다
+                    .onStatus(status -> status.value() == REFUSED_STATUS, (request, response) -> {
+                        throw new RestApiException(RefundErrorCode.PRODUCT_RELEASE_REFUSED);
+                    })
+                    .onStatus(status -> status.value() == NOT_FOUND_STATUS, (request, response) -> {
+                        throw new RestApiException(RefundErrorCode.PRODUCT_STOCK_NOT_FOUND);
+                    })
+                    .onStatus(status -> status.value() == INVALID_REQUEST_STATUS, (request, response) -> {
+                        throw new IllegalStateException("상품이 재고 해제 요청 값을 거절함(422, 환불이 보낸 값의 오류). refundId="
+                                + release.refundId() + ", orderId=" + release.orderId());
+                    })
+                    .toBodilessEntity();
+        } catch (ResourceAccessException e) {
+            // 응답 상태줄은 InternalRestClient 인터셉터(요청을 보내는 순간만 감쌈) 밖에서 읽는다. 그래서 응답을 읽다 끊기거나
+            // 3초가 지나면 인터셉터 대신 ResourceAccessException으로 올라와 500이 된다(#578). 주문 취소 반영과 같은 코드로 바꿔 503으로 맞춘다.
+            // onStatus가 던진 예외는 이 예외가 아니라 그대로 올라간다.
+            // RestApiException은 원인을 담지 못해, 여기서 버리면 시간 초과인지 끊김인지 알 수 없다. 그래서 바꾸기 전에 원인을 남긴다.
+            // 상품이 잠깐 안 되는 것이라 WARN이다(다시 시도는 알람이 한다)
+            log.warn("상품 재고 복구 응답을 읽지 못함(끊김·시간 초과). refundId={}, orderId={}", release.refundId(), release.orderId(), e);
+            throw new RestApiException(RefundErrorCode.PRODUCT_API_FAILED);
+        }
     }
 }
