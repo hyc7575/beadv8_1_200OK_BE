@@ -4,9 +4,11 @@ import com.ok.wallet.application.port.out.ChargeRepository;
 import com.ok.wallet.domain.Charge;
 import com.ok.wallet.domain.ChargeStatus;
 import lombok.RequiredArgsConstructor;
+import org.springframework.data.domain.Limit;
 import org.springframework.stereotype.Component;
 
 import java.time.LocalDateTime;
+import java.util.List;
 import java.util.Optional;
 
 /**
@@ -29,13 +31,38 @@ public class ChargeRepositoryAdapter implements ChargeRepository {
     }
 
     @Override
-    public int markInProgress(String chargeNo, String paymentKey, LocalDateTime now) {
-        return chargeJpaRepository.markInProgress(chargeNo, paymentKey, now);
+    public Optional<Charge> findForUpdateByChargeNo(String chargeNo) {
+        return chargeJpaRepository.findForUpdateByChargeNo(chargeNo);
+    }
+
+    @Override
+    public int markInProgress(String chargeNo, String paymentKey, LocalDateTime now, LocalDateTime nextCheckAt) {
+        return chargeJpaRepository.markInProgress(chargeNo, paymentKey, now, nextCheckAt);
     }
 
     @Override
     public int markFailedIfPending(String chargeNo, String failureCode, String failureMessage, LocalDateTime now) {
         return chargeJpaRepository.markFailedIfPending(chargeNo, failureCode, failureMessage, now);
+    }
+
+    @Override
+    public List<Charge> findDueForRecovery(LocalDateTime now, int limit) {
+        return chargeJpaRepository.findDueForRecovery(now, Limit.of(limit));
+    }
+
+    @Override
+    public int claimForRecovery(String chargeNo, LocalDateTime now, LocalDateTime nextCheckAt) {
+        return chargeJpaRepository.claimForRecovery(chargeNo, now, nextCheckAt);
+    }
+
+    @Override
+    public List<String> findInProgressChargeNosCreatedBefore(LocalDateTime createdBefore, int limit) {
+        return chargeJpaRepository.findInProgressChargeNosCreatedBefore(createdBefore, Limit.of(limit));
+    }
+
+    @Override
+    public int holdForReview(String chargeNo, LocalDateTime now) {
+        return chargeJpaRepository.holdForReview(chargeNo, now);
     }
 
     @Override
