@@ -91,7 +91,8 @@ class ProductServiceTest {
 		ProductImageUrlValidator imageUrlValidator = new ProductImageUrlValidator("bucket", "ap-northeast-2");
 		// ProductService가 Clock을 주입받으므로 생성자에 넣는다 (#93). 시각을 검증하는 테스트가 없어 실제 시계를 그대로 쓴다
 		service = new ProductService(productRepository, imageUrlValidator, productOptionRepository,
-			productQueryRepository, buyerProductQueryRepository, new ProductSearchPolicy(MIN_SCORE), productSearchIndexer, new ProductDescriptionSanitizer(imageUrlValidator),
+			productQueryRepository, buyerProductQueryRepository, new ProductSearchPolicy(MIN_SCORE), productSearchIndexer, new ProductItemDictionary(),
+			new ProductDescriptionSanitizer(imageUrlValidator),
 			new MediaUrlResolver("bucket", "ap-northeast-2"), Clock.systemDefaultZone());
 	}
 
@@ -295,7 +296,7 @@ class ProductServiceTest {
 		ArgumentCaptor<ProductSearchKeyword> captor = ArgumentCaptor.forClass(ProductSearchKeyword.class);
 		then(buyerProductQueryRepository).should()
 			.findVisibleProductIds(captor.capture(), any(), any(), any(), any(), anyDouble(), any());
-		assertThat(captor.getValue()).isEqualTo(new ProductSearchKeyword("샤인 머스캣", "샤인머스캣", "ㅅㅑㅇㅣㄴㅁㅓㅅㅡㅋㅐㅅ"));
+		assertThat(captor.getValue()).isEqualTo(new ProductSearchKeyword("샤인 머스캣", "샤인머스캣", "ㅅㅑㅇㅣㄴㅁㅓㅅㅡㅋㅐㅅ", false));
 	}
 
 	@Test

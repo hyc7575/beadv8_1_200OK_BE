@@ -2,6 +2,7 @@ package com.ok.product;
 
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.hamcrest.Matchers.contains;
+import static org.hamcrest.Matchers.nullValue;
 import static org.springframework.test.web.servlet.request.MockMvcRequestBuilders.get;
 import static org.springframework.test.web.servlet.result.MockMvcResultMatchers.jsonPath;
 import static org.springframework.test.web.servlet.result.MockMvcResultMatchers.status;
@@ -22,6 +23,7 @@ import org.springframework.data.domain.Page;
 import org.springframework.data.domain.PageRequest;
 import org.springframework.jdbc.core.JdbcTemplate;
 import org.springframework.test.web.servlet.MockMvc;
+import org.springframework.test.web.servlet.request.MockHttpServletRequestBuilder;
 import org.springframework.transaction.support.TransactionTemplate;
 
 import com.ok.product.product.adapter.out.persistence.ProductJpaRepository;
@@ -251,12 +253,77 @@ class ProductKeywordSearchIntegrationTest extends AbstractIntegrationTest {
 	}
 
 	@Test
+	void 가공_표현이_없는_검색어는_같은_품목의_원물을_가공품보다_위에_두고_전체_개수는_그대로다() {
+		// given
+		// 상품명과 옵션명에 "사과"가 더 많이 들어 있어 감점하지 않으면 원물보다 점수가 높다
+		Long appleJuice = create("청송 사과즙 30포", ProductCategoryCode.PROCESSED_AGRI,
+			ProductRegionCode.GYEONGBUK, "사과즙 30포");
+		// 한 페이지를 1개로 해야 첫 페이지가 다 차서 전체 개수를 따로 센다
+		PageRequest pageable = PageRequest.of(0, 1);
+
+		// when
+		Page<Long> sut = buyerProductQueryRepository.findVisibleProductIds(ProductSearchKeyword.from("사과").orElseThrow(),
+			null, null, null, ProductSort.RELEVANCE, 0.5, pageable);
+
+		// then
+		assertThat(sut.getContent()).containsExactly(apple);
+		assertThat(sut.getTotalElements()).isEqualTo(2);
+		assertThat(search("사과")).containsExactly(apple, appleJuice);
+	}
+
+	@Test
+	void 가공_표현이_있는_검색어는_가공품을_감점하지_않는다() {
+		// given
+		Long appleJuice = create("청송 사과즙 30포", ProductCategoryCode.PROCESSED_AGRI,
+			ProductRegionCode.GYEONGBUK, "사과즙 30포");
+
+		// when
+		List<Long> sut = search("사과즙");
+
+		// then
+		assertThat(sut).first().isEqualTo(appleJuice);
+	}
+
+	@Test
 	void 맞는_상품이_없으면_빈_목록과_전체_개수_0이다() throws Exception {
 		// when & then
 		mockMvc.perform(get("/api/v1/products").param("keyword", "컴퓨터"))
 			.andExpect(status().isOk())
 			.andExpect(jsonPath("$.content").isEmpty())
 			.andExpect(jsonPath("$.totalElements").value(0));
+	}
+
+	@Test
+	void 품목_오타로_검색하면_바른_품목을_제안하고_결과는_원래_검색어로_찾은_그대로다() throws Exception {
+		// given
+		create("영양 태양초 고춧가루 1kg", ProductCategoryCode.VEGETABLE, ProductRegionCode.GYEONGBUK, "고운 1kg");
+		create("청양 고추 1kg", ProductCategoryCode.VEGETABLE, ProductRegionCode.CHUNGNAM, "홍고추 1kg");
+		List<Long> typoResult = search("고추가루");
+
+		// when & then
+		mockMvc.perform(get("/api/v1/products").param("keyword", "고추가루"))
+			.andExpect(status().isOk())
+			.andExpect(jsonPath("$.suggestion").value("고춧가루"))
+			.andExpect(jsonPath("$.content[*].productId").value(
+				contains(typoResult.stream().map(Long::intValue).toArray())));
+	}
+
+	@ParameterizedTest
+	@MethodSource("제안이_없는_검색_요청")
+	void 품목_그대로_검색하거나_검색어가_없으면_제안은_null이다(Map<String, String> params) throws Exception {
+		// given
+		MockHttpServletRequestBuilder request = get("/api/v1/products");
+		params.forEach(request::param);
+
+		// when & then
+		mockMvc.perform(request)
+			.andExpect(status().isOk())
+			.andExpect(jsonPath("$.content").isNotEmpty())
+			.andExpect(jsonPath("$.suggestion").value(nullValue()));
+	}
+
+	static Stream<Map<String, String>> 제안이_없는_검색_요청() {
+		return Stream.of(Map.of("keyword", "사과"), Map.of());
 	}
 
 	@ParameterizedTest
