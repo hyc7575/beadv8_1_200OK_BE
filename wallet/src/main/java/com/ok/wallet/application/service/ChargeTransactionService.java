@@ -1,6 +1,7 @@
 package com.ok.wallet.application.service;
 
 import com.ok.common.exception.RestApiException;
+import com.ok.wallet.application.dto.ChargeAdminResult;
 import com.ok.wallet.application.dto.ChargeConfirmResult;
 import com.ok.wallet.application.port.out.ChargeRepository;
 import com.ok.wallet.domain.BuyerWallet;
@@ -89,11 +90,17 @@ class ChargeTransactionService {
         // 잠그기 전에 충전 건을 읽지 않는다. 먼저 읽으면 잠금 조회가 그때 읽어 둔 옛 상태를 그대로 돌려준다
         buyerWalletService.getOrCreate(memberId);
         Charge charge = findOwnedChargeForUpdate(memberId, chargeNo);
+        if (charge.isPaymentCancelRequested()) {
+            // 관리자가 토스 결제를 취소하는 중이거나 취소 결과를 모르는 건이다. 반영하면 환불과 잔액 증가가 함께 일어날 수 있다
+            log.warn("결제 취소를 요청한 충전 건이라 잔액에 반영하지 않습니다. chargeNo={}", chargeNo);
+            return ChargeConfirmResult.from(charge);
+        }
         if (charge.getStatus() != ChargeStatus.IN_PROGRESS) {
             // 복구 스케줄러가 먼저 처리한 경우다. 이미 완료면 정상이지만, 실패로 처리된 건이면
-            // 토스는 승인했는데 잔액에 반영되지 않은 상태라 환불 등 확인이 필요하다
+            // 토스는 승인했는데 잔액에 반영되지 않은 상태라 관리자가 결제를 취소해야 한다. 로그를 놓쳐도 처리 목록에 뜨게 남긴다
             if (charge.getStatus() == ChargeStatus.FAILED) {
                 log.error("[CHARGE_APPROVED_BUT_FAILED] 토스는 승인했지만 충전 건이 이미 실패로 처리되어 있습니다. chargeNo={}", chargeNo);
+                charge.markApprovedAfterFailure(LocalDateTime.now(clock));
             }
             return ChargeConfirmResult.from(charge);
         }
@@ -110,7 +117,8 @@ class ChargeTransactionService {
     @Transactional(isolation = Isolation.READ_COMMITTED)
     public ChargeConfirmResult failApproval(Long memberId, String chargeNo, String failureCode, String failureMessage) {
         Charge charge = findOwnedChargeForUpdate(memberId, chargeNo);
-        if (charge.getStatus() == ChargeStatus.IN_PROGRESS) {
+        // 결제 취소를 요청한 건은 취소 결과로만 끝낸다
+        if (charge.getStatus() == ChargeStatus.IN_PROGRESS && !charge.isPaymentCancelRequested()) {
             // 토스가 준 거절 코드·메시지는 길이를 통제할 수 없어, 컬럼 길이에 맞춰 잘라 저장한다
             charge.fail(truncate(failureCode, 100), truncate(failureMessage, 500), LocalDateTime.now(clock));
         }
@@ -157,6 +165,54 @@ class ChargeTransactionService {
     @Transactional
     public void holdForReview(String chargeNo) {
         chargeRepository.holdForReview(chargeNo, LocalDateTime.now(clock));
+    }
+
+    /** 관리자가 볼 충전 건을 읽는다. 관리자는 회원과 상관없이 모든 충전 건을 본다. */
+    @Transactional(readOnly = true)
+    public Charge findCharge(String chargeNo) {
+        return chargeRepository.findByChargeNo(chargeNo)
+                .orElseThrow(() -> new RestApiException(WalletErrorCode.CHARGE_NOT_FOUND));
+    }
+
+    /** 관리자가 처리할 충전 건을 읽는다. */
+    @Transactional(readOnly = true)
+    public List<Charge> findAdminTargets(int limit) {
+        return chargeRepository.findAdminTargets(limit);
+    }
+
+    /**
+     * 관리자가 토스 결제 취소를 요청한 것을 남긴다. 토스를 부르기 전에 충전 건을 잠그고 남기므로,
+     * 같은 건의 잔액 반영과 겹쳐도 한쪽만 된다.
+     *
+     * @throws RestApiException 그 사이 처리 중이 아니게 됐으면 {@code CHARGE_NOT_ADMIN_HANDLEABLE}
+     */
+    @Transactional(isolation = Isolation.READ_COMMITTED)
+    public void requestPaymentCancel(String chargeNo) {
+        Charge charge = chargeRepository.findForUpdateByChargeNo(chargeNo)
+                .orElseThrow(() -> new RestApiException(WalletErrorCode.CHARGE_NOT_FOUND));
+        if (charge.getStatus() != ChargeStatus.IN_PROGRESS) {
+            throw new RestApiException(WalletErrorCode.CHARGE_NOT_ADMIN_HANDLEABLE,
+                    "처리하는 사이 충전 건 상태가 바뀌었습니다. 현재 상태: " + charge.getStatus());
+        }
+        charge.requestPaymentCancel(LocalDateTime.now(clock));
+    }
+
+    /**
+     * 관리자가 토스 결제를 취소한 것을 충전 건에 기록한다. 토스 취소가 확인된 뒤에만 부른다.
+     * 충전 건을 잠근 뒤 상태를 보므로, 늦게 온 승인 응답과 겹쳐도 한쪽만 반영된다.
+     */
+    @Transactional(isolation = Isolation.READ_COMMITTED)
+    public ChargeAdminResult recordPaymentCanceled(String chargeNo, String reason) {
+        Charge charge = chargeRepository.findForUpdateByChargeNo(chargeNo)
+                .orElseThrow(() -> new RestApiException(WalletErrorCode.CHARGE_NOT_FOUND));
+        if (charge.getStatus() == ChargeStatus.COMPLETED) {
+            // 토스를 부르기 전에 남긴 취소 요청 표시가 완료를 막으므로 생기지 않아야 한다.
+            // 생겼다면 환불도 됐고 잔액도 늘어 잔액 회수가 필요하다
+            log.error("[CHARGE_CANCELED_BUT_COMPLETED] 토스 결제를 취소했지만 충전 건이 이미 완료되어 있습니다. chargeNo={}", chargeNo);
+            return ChargeAdminResult.from(charge);
+        }
+        charge.recordPaymentCanceled(truncate(reason, 500), LocalDateTime.now(clock));
+        return ChargeAdminResult.from(charge);
     }
 
     // 타인의 충전 건은 존재 여부도 알리지 않도록 없는 것과 같게 응답한다

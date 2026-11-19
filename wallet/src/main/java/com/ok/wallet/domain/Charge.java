@@ -31,6 +31,8 @@ public class Charge extends BaseTime {
     // 결제 건마다 PG 수수료와 승인 호출이 생기므로 초소액 충전을 막는다. 단위 제한은 두지 않는다 (#274)
     public static final long MIN_AMOUNT = 10_000;
     private static final String CHARGE_NO_PREFIX = "CHG_";
+    // 관리자가 토스 결제를 취소해 실패로 끝낸 처리 중 건의 실패 코드
+    private static final String PAYMENT_CANCELED_FAILURE_CODE = "PAYMENT_CANCELED";
 
     @Id
     @GeneratedValue(strategy = GenerationType.IDENTITY)
@@ -73,6 +75,20 @@ public class Charge extends BaseTime {
     @Column(name = "check_count", nullable = false)
     private int checkCount;
 
+    // 실패로 처리된 뒤 토스가 승인한 것을 안 시각. 돈은 빠졌는데 잔액이 늘지 않은 상태라 관리자가 결제를 취소할 대상이다.
+    // 로그만으로는 놓칠 수 있고, 실패 건은 DB만 봐서는 승인 여부를 알 수 없어 따로 남긴다
+    @Column(name = "approved_after_failure_at")
+    private LocalDateTime approvedAfterFailureAt;
+
+    // 관리자가 토스 결제 취소를 요청한 시각. 토스 취소는 트랜잭션 밖이라, 그 사이 같은 건이 잔액에 반영되면
+    // 환불과 잔액 증가가 함께 일어난다. 토스를 부르기 전에 남겨 두고, 값이 있는 처리 중 건은 완료·실패로 바꾸지 않는다
+    @Column(name = "payment_cancel_requested_at")
+    private LocalDateTime paymentCancelRequestedAt;
+
+    // 관리자가 토스 결제를 취소(환불)한 시각. 새 상태를 두면 상태 규칙과 한도 합계를 모두 고쳐야 해서 상태는 실패로 둔다
+    @Column(name = "payment_canceled_at")
+    private LocalDateTime paymentCanceledAt;
+
     private Charge(Long memberId, long amount) {
         this.chargeNo = CHARGE_NO_PREFIX + UUID.randomUUID();
         this.memberId = memberId;
@@ -102,6 +118,61 @@ public class Charge extends BaseTime {
         changeStatus(ChargeStatus.COMPLETED);
         this.paymentKey = paymentKey;
         this.completedAt = completedAt;
+    }
+
+    /** 실패로 처리된 충전 건을 토스가 승인한 것을 기록한다. 같은 건을 여러 번 알게 돼도 처음 안 시각을 남긴다. */
+    public void markApprovedAfterFailure(LocalDateTime knownAt) {
+        if (status != ChargeStatus.FAILED) {
+            throw new IllegalStateException("실패한 충전 건만 승인 뒤 실패로 기록할 수 있습니다. chargeNo=" + chargeNo + ", status=" + status);
+        }
+        if (approvedAfterFailureAt == null) {
+            approvedAfterFailureAt = knownAt;
+        }
+    }
+
+    /** 관리자가 토스 결제 취소를 요청한 처리 중 건이다. 취소 결과가 정해질 때까지 완료·실패로 바꾸지 않는다. */
+    public boolean isPaymentCancelRequested() {
+        return status == ChargeStatus.IN_PROGRESS && paymentCancelRequestedAt != null;
+    }
+
+    /**
+     * 관리자가 토스 결제 취소를 요청한 것을 남긴다. 처리 중인 건만 남기고, 이미 있으면 처음 요청한 시각을 둔다.
+     * 표시는 취소가 기록되면 끝나고 코드로 지우지 않는다. 거절을 받은 요청은 다른 요청의 취소가 토스에서
+     * 아직 진행 중인지 알 수 없어서, 지우면 그 사이 잔액이 반영돼 환불과 함께 일어날 수 있다.
+     */
+    public void requestPaymentCancel(LocalDateTime requestedAt) {
+        if (status != ChargeStatus.IN_PROGRESS) {
+            throw new IllegalStateException("처리 중인 충전 건만 결제 취소를 요청할 수 있습니다. chargeNo=" + chargeNo + ", status=" + status);
+        }
+        if (paymentCancelRequestedAt == null) {
+            paymentCancelRequestedAt = requestedAt;
+        }
+    }
+
+    /** 복구가 토스 답만으로 정하지 못해 멈춘 건이다. 관리자가 처리할 때까지 처리 중으로 남는다. */
+    public boolean isHeldForReview() {
+        return status == ChargeStatus.IN_PROGRESS && nextCheckAt == null;
+    }
+
+    /** 실패로 처리된 뒤 토스가 승인해, 관리자가 결제를 취소해야 하는 건이다. */
+    public boolean isAwaitingPaymentCancel() {
+        return status == ChargeStatus.FAILED && approvedAfterFailureAt != null && paymentCanceledAt == null;
+    }
+
+    /**
+     * 관리자가 토스 결제를 취소(환불)한 것을 기록한다. 처리 중인 건은 실패로 바꾸고, 이미 실패한 건은 원래 실패 사유를 그대로 둔다.
+     * 같은 건을 다시 기록해도 처음 취소 시각을 남긴다.
+     */
+    public void recordPaymentCanceled(String reason, LocalDateTime canceledAt) {
+        if (status == ChargeStatus.IN_PROGRESS) {
+            fail(PAYMENT_CANCELED_FAILURE_CODE, reason, canceledAt);
+        }
+        if (status != ChargeStatus.FAILED) {
+            throw new IllegalStateException("처리 중이거나 실패한 충전 건만 결제 취소를 기록할 수 있습니다. chargeNo=" + chargeNo + ", status=" + status);
+        }
+        if (paymentCanceledAt == null) {
+            paymentCanceledAt = canceledAt;
+        }
     }
 
     /** 결제 실패 또는 명확한 승인 실패로 충전 건을 실패 처리한다. 대기·처리 중인 건만 실패할 수 있다. */
