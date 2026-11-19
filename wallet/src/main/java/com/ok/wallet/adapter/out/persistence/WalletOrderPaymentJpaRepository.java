@@ -10,6 +10,8 @@ import org.springframework.data.repository.Repository;
 import org.springframework.data.repository.query.Param;
 
 import java.time.LocalDateTime;
+import java.util.Collection;
+import java.util.List;
 import java.util.Optional;
 
 // 결제 결과는 한 번 기록하면 바뀌지 않으므로 넣기와 조회만 둔다.
@@ -19,14 +21,17 @@ public interface WalletOrderPaymentJpaRepository extends Repository<WalletOrderP
     // BaseTime을 거치지 않아 시각을 직접 받으므로, 엔티티에 NOT NULL 컬럼이 늘면 이 쿼리도 고친다
     @Modifying
     @Query(value = "INSERT IGNORE INTO " + WalletSchema.NAME + """
-            .wallet_order_payment (order_id, buyer_id, amount, status, created_at, updated_at)
-            VALUES (:orderId, :buyerId, :amount, :status, :now, :now)
+            .wallet_order_payment (order_id, buyer_id, amount, order_summary, status, created_at, updated_at)
+            VALUES (:orderId, :buyerId, :amount, :orderSummary, :status, :now, :now)
             """, nativeQuery = true)
     int insertIfAbsent(@Param("orderId") Long orderId, @Param("buyerId") Long buyerId, @Param("amount") long amount,
-                       @Param("status") String status, @Param("now") LocalDateTime now);
+                       @Param("orderSummary") String orderSummary, @Param("status") String status,
+                       @Param("now") LocalDateTime now);
 
     @Lock(LockModeType.PESSIMISTIC_READ)
     Optional<WalletOrderPayment> findForShareByOrderId(Long orderId);
 
     Optional<WalletOrderPayment> findByOrderId(Long orderId);
+
+    List<WalletOrderPayment> findByOrderIdIn(Collection<Long> orderIds);
 }

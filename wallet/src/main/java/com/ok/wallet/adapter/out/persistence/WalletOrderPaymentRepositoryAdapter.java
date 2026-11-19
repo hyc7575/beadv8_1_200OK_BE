@@ -6,6 +6,8 @@ import lombok.RequiredArgsConstructor;
 import org.springframework.stereotype.Component;
 
 import java.time.LocalDateTime;
+import java.util.Collection;
+import java.util.List;
 import java.util.Optional;
 
 /**
@@ -18,8 +20,9 @@ public class WalletOrderPaymentRepositoryAdapter implements WalletOrderPaymentRe
     private final WalletOrderPaymentJpaRepository walletOrderPaymentJpaRepository;
 
     @Override
-    public int insertIfAbsent(Long orderId, Long buyerId, long amount, String status, LocalDateTime now) {
-        return walletOrderPaymentJpaRepository.insertIfAbsent(orderId, buyerId, amount, status, now);
+    public int insertIfAbsent(Long orderId, Long buyerId, long amount, String orderSummary, String status,
+                              LocalDateTime now) {
+        return walletOrderPaymentJpaRepository.insertIfAbsent(orderId, buyerId, amount, orderSummary, status, now);
     }
 
     @Override
@@ -30,5 +33,10 @@ public class WalletOrderPaymentRepositoryAdapter implements WalletOrderPaymentRe
     @Override
     public Optional<WalletOrderPayment> findByOrderId(Long orderId) {
         return walletOrderPaymentJpaRepository.findByOrderId(orderId);
+    }
+
+    @Override
+    public List<WalletOrderPayment> findAllByOrderIdIn(Collection<Long> orderIds) {
+        return walletOrderPaymentJpaRepository.findByOrderIdIn(orderIds);
     }
 }
