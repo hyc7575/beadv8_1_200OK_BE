@@ -7,7 +7,10 @@ import com.ok.payout.application.port.out.BlockedOrderRow;
 import com.ok.payout.application.port.out.OverchargeCandidateRow;
 import com.ok.payout.application.port.out.PayoutBlockedOrderRepository;
 import com.ok.payout.application.port.out.PayoutQueryRepository;
+import com.ok.payout.application.port.out.PendingAdjustmentRow;
 import com.ok.payout.domain.PayoutBlockedOrderCause;
+import com.ok.payout.domain.PayoutBlockedStatus;
+import com.ok.payout.domain.PayoutEventType;
 import com.ok.payout.domain.PayoutFailureReason;
 import com.ok.payout.domain.PayoutOverchargeEvidence;
 import lombok.RequiredArgsConstructor;
@@ -76,7 +79,13 @@ public class PayoutBlockedOrderService implements PayoutBlockedOrderUseCase {
     @Override
     @Transactional(readOnly = true)
     public Page<PayoutBlockedOrderResult> getBlockedOrders(PayoutBlockedOrderSearchQuery query) {
-        Page<BlockedOrderRow> page = payoutQueryRepository.findBlockedOrders(PageRequest.of(query.page(), query.size()));
+        // 상태 이름은 요청 DTO가 LOCKED·STOPPED·RESOLVED만 받으므로 그대로 바꿈 (PENDING은 들어오지 않음)
+        List<PayoutBlockedStatus> statuses = new ArrayList<>();
+        for (String status : query.statuses()) {
+            statuses.add(PayoutBlockedStatus.valueOf(status));
+        }
+        Page<BlockedOrderRow> page = payoutQueryRepository.findBlockedOrders(
+                query.orderId(), statuses, PageRequest.of(query.page(), query.size()));
         List<Long> orderIds = new ArrayList<>();
         for (BlockedOrderRow row : page.getContent()) {
             orderIds.add(row.orderId());
@@ -86,8 +95,20 @@ public class PayoutBlockedOrderService implements PayoutBlockedOrderUseCase {
             causesByOrder.computeIfAbsent(cause.getOrderId(), id -> new ArrayList<>()).add(cause);
         }
         Map<Long, PayoutOverchargeEvidence> evidenceNowByOrder = currentOverchargeEvidence(causesByOrder);
+        // 해결 대기 조정 합계 (#723): 한 페이지 주문 ID로 한 번만 조회. "지금" 근거 합계에는 섞지 않음
+        //   "지금" 근거는 금액 검사와 같은 범위라는 약속(#570)을 지키고, 해결하지 않아도 통과할 것처럼 보이지 않게
+        Map<Long, Long> pendingSaleAmount = new HashMap<>();
+        Map<Long, Long> pendingSaleFee = new HashMap<>();
+        for (PendingAdjustmentRow pending : payoutQueryRepository.sumPendingAdjustmentsByOrderIds(orderIds)) {
+            if (pending.eventType() == PayoutEventType.SALE_AMOUNT) {
+                pendingSaleAmount.put(pending.orderId(), pending.amount());
+            } else if (pending.eventType() == PayoutEventType.SALE_FEE) {
+                pendingSaleFee.put(pending.orderId(), pending.amount());
+            }
+        }
         return page.map(row -> PayoutQueryResultMapper.toBlockedOrderResult(
-                row, causesByOrder.getOrDefault(row.orderId(), List.of()), evidenceNowByOrder.get(row.orderId())));
+                row, causesByOrder.getOrDefault(row.orderId(), List.of()), evidenceNowByOrder.get(row.orderId()),
+                pendingSaleAmount.getOrDefault(row.orderId(), 0L), pendingSaleFee.getOrDefault(row.orderId(), 0L)));
     }
 
     // "지금" 초과 청구 근거 (#570): 원인에 초과 청구가 있는 주문만, 볼 때의 원본으로 계산 (주문 ID → 근거)

@@ -2,6 +2,7 @@ package com.ok.payout.application.port.out;
 
 import com.ok.payout.domain.Payout;
 import com.ok.payout.domain.PayoutBlockedOrderCause;
+import com.ok.payout.domain.PayoutBlockedStatus;
 import com.ok.payout.domain.PayoutCandidateItem;
 import com.ok.payout.domain.PayoutFailure;
 import org.springframework.data.domain.Page;
@@ -114,11 +115,12 @@ public interface PayoutQueryRepository {
     Page<Payout> searchPayouts(Long payeeId, Boolean system, LocalDateTime from, LocalDateTime to,
                               Pageable pageable);
 
-    // 정산후보 목록 (관리자·판매자 조회). sellerId가 null이면 전체 판매자
+    // 정산후보 목록 (관리자·판매자 조회). sellerId가 null이면 전체 판매자, orderId가 null이면 전체 주문
+    // from·to는 null이면 그쪽 경계를 걸지 않음: 관리자가 주문 ID로 찾을 때만 null이 옴(#723). 판매자 조회는 요청 DTO가 늘 기간을 채움
     // sellerShareOnly면 시스템 몫(수수료) 후보를 뺌 (판매자 조회용)
     // 정렬은 후보 생성 시각 최신순 고정. 같은 시각에 생긴 후보가 여러 건(대금·수수료·배송비가 함께 생김)이라 id를 더해 페이지를 넘겨도 순서가 흔들리지 않게 함
     // 정산 ID는 payout_item과 LEFT JOIN으로 가져옴 (payout_item.candidate_id가 유니크라 후보 한 건이 여러 줄로 늘지 않음)
-    Page<CandidateRow> searchCandidates(Long sellerId, LocalDateTime from, LocalDateTime to,
+    Page<CandidateRow> searchCandidates(Long orderId, Long sellerId, LocalDateTime from, LocalDateTime to,
                                          boolean unsettledOnly, boolean sellerShareOnly, Pageable pageable);
 
     // 정산 1건의 항목을 정산후보와 함께 페이지 단위로 조회 (항목마다 후보를 따로 조회하지 않도록 조인 1번)
@@ -198,10 +200,21 @@ public interface PayoutQueryRepository {
     // 정렬은 요청의 해결 시각(그 요청에서 가장 이른 줄) 최신순, 같으면 나중에 저장한 요청이 먼저
     Page<PayoutResolutionRequestRow> findResolutionRequestsByOrderId(Long orderId, Pageable pageable);
 
+    // 기간 안에 해결한 요청을 요청 1번 = 1줄로 페이지 단위로 조회 (#723, 해결 기록 전체 목록)
+    // 기간은 요청의 해결 시각(그 요청에서 가장 이른 줄) 기준 [from, to): 경계에 걸친 요청이 두 기간으로 갈라지지 않게
+    // adminId가 null이면 전체 관리자. 정렬은 주문별 묶음 보기와 같음 (해결 시각 최신순, 같으면 나중에 저장한 요청이 먼저)
+    Page<PayoutResolutionRequestRow> findResolutionRequestsInPeriod(LocalDateTime from, LocalDateTime to, Long adminId,
+                                                                    Pageable pageable);
+
     // 관리자 막힌 주문 목록 (#569): 막힌 주문 집계 표(#582)를 읽기만 함. 판정은 표가 정산 Job 끝에 끝내 둠
     // 예비(PENDING) 줄은 뺌 (#570): 금액 검사가 근거를 남기려고 넣은 줄이라 아직 막힌 주문이 아님 (개수에서도 뺌)
     // 정렬은 마지막 실패 시각 최신순, 같으면 주문 ID 역순 (한 실행에서 막힌 주문은 시각이 거의 같아 페이지를 넘겨도 순서가 흔들리지 않게)
-    Page<BlockedOrderRow> findBlockedOrders(Pageable pageable);
+    // orderId가 null이면 전체, statuses가 비면 세 상태 모두 (#723)
+    Page<BlockedOrderRow> findBlockedOrders(Long orderId, Collection<PayoutBlockedStatus> statuses, Pageable pageable);
+
+    // 막힌 주문의 해결 대기 조정 합계 (#723): 지금 해결하면 확인한 조정이 될 조정을 주문·종류(판매 대금·수수료)별로 더함
+    // 줄이 없으면 그 주문·종류는 0. orderIds가 비면 조회하지 않고 빈 목록
+    List<PendingAdjustmentRow> sumPendingAdjustmentsByOrderIds(Collection<Long> orderIds);
 
     // 그 주문들의 원인 (#569, 막힌 주문 표의 하위 표). 주문 ID, 실패 시각 최신순. orderIds가 비면 빈 목록
     List<PayoutBlockedOrderCause> findBlockedOrderCauses(Collection<Long> orderIds);

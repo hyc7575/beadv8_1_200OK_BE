@@ -9,6 +9,7 @@ import com.ok.payout.application.port.out.DepositCheckReviewRow;
 import com.ok.payout.application.port.out.DraftItemRow;
 import com.ok.payout.application.port.out.FailureRow;
 import com.ok.payout.application.port.out.OverchargeCandidateRow;
+import com.ok.payout.application.port.out.PendingAdjustmentRow;
 import com.ok.payout.application.port.out.PayoutItemRow;
 import com.ok.payout.application.port.out.PayoutResolutionRequestRow;
 import com.ok.payout.application.port.out.PayoutResolutionRow;
@@ -41,10 +42,12 @@ import com.querydsl.jpa.impl.JPAQueryFactory;
 import jakarta.persistence.EntityManager;
 import lombok.RequiredArgsConstructor;
 import org.springframework.data.domain.Page;
+import org.springframework.data.domain.PageImpl;
 import org.springframework.data.domain.Pageable;
 import org.springframework.data.support.PageableExecutionUtils;
 import org.springframework.stereotype.Repository;
 
+import java.time.Duration;
 import java.time.LocalDateTime;
 import java.util.ArrayList;
 import java.util.Collection;
@@ -79,6 +82,14 @@ import static com.ok.payout.domain.QPayoutWalletDeductionConflict.payoutWalletDe
 @Repository
 @RequiredArgsConstructor
 public class PayoutQuerydslRepository implements PayoutQueryRepository {
+
+    // 해결 기록 전체 목록(#723)에서 기간 경계 앞뒤로 더 읽는 폭: 한 해결 요청의 줄이 경계에 걸쳐도 다 읽어 가장 이른 줄로 판정하려고
+    //   한 요청의 줄은 한 트랜잭션에서 저장되어 시각 차이가 밀리초 수준이라 1분이면 넉넉함
+    private static final Duration RESOLUTION_REQUEST_SCAN_SLACK = Duration.ofMinutes(1);
+
+    // 관리자가 보고 조정을 넣는 금액 불일치 사유 (#291 결정 4번). 확인한 조정·해결 대기 조정(#723)이 함께 씀
+    private static final List<PayoutFailureReason> ADJUSTMENT_CONFIRMING_REASONS =
+            List.of(PayoutFailureReason.AMOUNT_MISMATCH, PayoutFailureReason.FEE_MISMATCH);
 
     // 주문별 실패 횟수 SQL의 공통 앞부분 (countFailedRunsByOrder·countFailedRunsOfOrder가 함께 씀, 조건 설명은 countFailedRunsByOrder 주석)
     // 두 메서드가 같은 문자열을 써야 스냅샷의 멈춤 판정과 해결 API의 멈춤 판정이 어긋나지 않음. 끝은 WHERE 조건 뒤라 "AND ..." 또는 "GROUP BY"를 붙임
@@ -476,11 +487,102 @@ public class PayoutQuerydslRepository implements PayoutQueryRepository {
         });
     }
 
-    // 막힌 주문 목록 (#569): 집계 표만 읽음 (원본 실패 기록을 다시 계산하지 않음, payout/CLAUDE.md 설계 전제)
-    // 정렬은 인덱스 (status, last_failed_at)의 뒷자리를 씀. 상태로 거르지 않아 인덱스로 정렬을 다 하지는 못하지만,
-    //   표는 막힌 주문 수만큼이라 운영 기간과 상관없이 작음
+    // 해결 기록 전체 목록 (#723): 두 번 읽음
+    //   1. 기간 안 요청 번호와 해결 시각(가장 이른 줄)을 idx_payout_failure_resolution_created_at_resolution_request_id로 고름
+    //      (관리자로 거를 때만 표를 다시 읽음). 묶은 결과를 다 가져와 개수·페이지를 자바에서 냄:
+    //      기간을 요청의 가장 이른 줄(HAVING)로 판정해서 countDistinct로 바로 셀 수 없음. 가져오는 것은 요청 번호·시각·ID뿐
+    //      (미확인) 가정: 막힌 주문 하루 100건이 다 해결되면 1년(최대 기간) 요청 36,500개.
+    //        해결 1번은 그 주문의 해결 안 된 실패 수만큼 줄을 남겨(보통 상품·종류 × 실패 횟수) 인덱스 항목은 그 10~20배.
+    //        페이지마다 이 범위를 한 번 읽음. 대량 데이터로 실행 계획을 본 적은 없음
+    //   2. 고른 페이지의 요청(최대 100개)만 메모·주문·푼 실패 수를 묶어 읽음
+    //      읽는 시각 범위를 그 페이지 요청들의 가장 이른 시각 ~ 가장 늦은 시각 + 여유로 좁힘:
+    //      요청 번호로 시작하는 인덱스가 없어, 기간 전체로 읽으면 1번과 같은 양을 한 번 더 읽음
+    // 기간 판정은 요청의 가장 이른 줄로 함: 줄마다 판정하면 경계에 걸친 요청이 두 기간으로 갈라져 푼 실패 수가 덜 셈
+    //   그러려고 줄을 앞뒤로 RESOLUTION_REQUEST_SCAN_SLACK만큼 넓게 읽음. 한 요청의 줄은 한 트랜잭션에서 저장되어(PayoutFailureResolutionService) 시각 차이가 아주 작음
     @Override
-    public Page<BlockedOrderRow> findBlockedOrders(Pageable pageable) {
+    public Page<PayoutResolutionRequestRow> findResolutionRequestsInPeriod(LocalDateTime from, LocalDateTime to, Long adminId,
+                                                                           Pageable pageable) {
+        LocalDateTime scanFrom = from.minus(RESOLUTION_REQUEST_SCAN_SLACK);
+        LocalDateTime scanTo = to.plus(RESOLUTION_REQUEST_SCAN_SLACK);
+        BooleanBuilder rowCondition = new BooleanBuilder(payoutFailureResolution.createdAt.goe(scanFrom)
+                .and(payoutFailureResolution.createdAt.lt(scanTo)));
+        if (adminId != null) {
+            rowCondition.and(payoutFailureResolution.adminId.eq(adminId));
+        }
+        List<Tuple> requests = queryFactory
+                .select(payoutFailureResolution.resolutionRequestId, payoutFailureResolution.createdAt.min(),
+                        payoutFailureResolution.id.max())
+                .from(payoutFailureResolution)
+                .where(rowCondition)
+                .groupBy(payoutFailureResolution.resolutionRequestId)
+                .having(payoutFailureResolution.createdAt.min().goe(from), payoutFailureResolution.createdAt.min().lt(to))
+                .orderBy(payoutFailureResolution.createdAt.min().desc(), payoutFailureResolution.id.max().desc())
+                .fetch();
+
+        int start = (int) Math.min(pageable.getOffset(), requests.size());
+        int end = Math.min(start + pageable.getPageSize(), requests.size());
+        List<String> pageRequestIds = new ArrayList<>();
+        LocalDateTime pageEarliest = null;
+        LocalDateTime pageLatest = null;
+        for (Tuple request : requests.subList(start, end)) {
+            pageRequestIds.add(request.get(payoutFailureResolution.resolutionRequestId));
+            LocalDateTime resolvedAt = request.get(payoutFailureResolution.createdAt.min());
+            if (pageEarliest == null || resolvedAt.isBefore(pageEarliest)) {
+                pageEarliest = resolvedAt;
+            }
+            if (pageLatest == null || resolvedAt.isAfter(pageLatest)) {
+                pageLatest = resolvedAt;
+            }
+        }
+        if (pageRequestIds.isEmpty()) {
+            return new PageImpl<>(List.of(), pageable, requests.size());
+        }
+
+        List<PayoutResolutionRequestRow> details = queryFactory
+                .select(Projections.constructor(PayoutResolutionRequestRow.class,
+                        payoutFailureResolution.resolutionRequestId,
+                        payoutFailureResolution.orderId,
+                        payoutFailureResolution.method,
+                        payoutFailureResolution.adminId,
+                        payoutFailureResolution.createdAt.min(),
+                        payoutFailureResolution.memo,
+                        payoutFailureResolution.count()))
+                .from(payoutFailureResolution)
+                // 요청의 줄은 그 요청의 가장 이른 시각부터 시작하고 여유(1분) 안에 끝남 (위 전제)
+                .where(payoutFailureResolution.resolutionRequestId.in(pageRequestIds),
+                        payoutFailureResolution.createdAt.goe(pageEarliest),
+                        payoutFailureResolution.createdAt.lt(pageLatest.plus(RESOLUTION_REQUEST_SCAN_SLACK)))
+                .groupBy(payoutFailureResolution.resolutionRequestId,
+                        payoutFailureResolution.orderId,
+                        payoutFailureResolution.method,
+                        payoutFailureResolution.adminId,
+                        payoutFailureResolution.memo)
+                .fetch();
+        Map<String, PayoutResolutionRequestRow> rowsByRequestId = new HashMap<>();
+        for (PayoutResolutionRequestRow detail : details) {
+            rowsByRequestId.put(detail.resolutionRequestId(), detail);
+        }
+        // 1번에서 정한 순서대로 놓음 (2번은 IN 조회라 순서가 없음)
+        List<PayoutResolutionRequestRow> content = new ArrayList<>();
+        for (String requestId : pageRequestIds) {
+            content.add(rowsByRequestId.get(requestId));
+        }
+        return new PageImpl<>(content, pageable, requests.size());
+    }
+
+    // 막힌 주문 목록 (#569): 집계 표만 읽음 (원본 실패 기록을 다시 계산하지 않음, payout/CLAUDE.md 설계 전제)
+    // 정렬은 인덱스 (status, last_failed_at)의 뒷자리를 씀. 상태를 여럿 고르거나 안 고르면 인덱스로 정렬을 다 하지는 못하지만,
+    //   표는 막힌 주문 수만큼이라 운영 기간과 상관없이 작음
+    // 주문 ID 조건(#723)은 기본 키(order_id)로 한 줄만 읽음
+    @Override
+    public Page<BlockedOrderRow> findBlockedOrders(Long orderId, Collection<PayoutBlockedStatus> statuses, Pageable pageable) {
+        BooleanBuilder condition = new BooleanBuilder(notPendingBlockedOrder());
+        if (orderId != null) {
+            condition.and(payoutBlockedOrder.orderId.eq(orderId));
+        }
+        if (!statuses.isEmpty()) {
+            condition.and(payoutBlockedOrder.status.in(statuses));
+        }
         List<BlockedOrderRow> content = queryFactory
                 .select(Projections.constructor(BlockedOrderRow.class,
                         payoutBlockedOrder.orderId,
@@ -489,7 +591,7 @@ public class PayoutQuerydslRepository implements PayoutQueryRepository {
                         payoutBlockedOrder.lastFailedAt,
                         payoutBlockedOrder.overchargeEvidence))
                 .from(payoutBlockedOrder)
-                .where(notPendingBlockedOrder())
+                .where(condition)
                 .orderBy(payoutBlockedOrder.lastFailedAt.desc(), payoutBlockedOrder.orderId.desc())
                 .offset(pageable.getOffset())
                 .limit(pageable.getPageSize())
@@ -498,10 +600,31 @@ public class PayoutQuerydslRepository implements PayoutQueryRepository {
         return PageableExecutionUtils.getPage(content, pageable, () -> {
             Long count = queryFactory.select(payoutBlockedOrder.count())
                     .from(payoutBlockedOrder)
-                    .where(notPendingBlockedOrder())
+                    .where(condition)
                     .fetchOne();
             return Objects.requireNonNullElse(count, 0L);
         });
+    }
+
+    // 막힌 주문의 해결 대기 조정 합계 (#723): 한 페이지 주문 ID로 한 번만 조회 (주문마다 따로 조회하지 않음, payout/CLAUDE.md 설계 전제)
+    // 판매 대금·수수료만 셈: 배송비는 조정할 수 없음(#291 결정 6번)
+    // order_id로 시작하는 유니크 인덱스(uk_payout_candidate_items_order_id_ship_seller_id_adjustment_id)로 그 주문들의 후보만 읽음
+    @Override
+    public List<PendingAdjustmentRow> sumPendingAdjustmentsByOrderIds(Collection<Long> orderIds) {
+        if (orderIds.isEmpty()) {
+            return List.of();
+        }
+        return queryFactory
+                .select(Projections.constructor(PendingAdjustmentRow.class,
+                        payoutCandidateItem.orderId,
+                        payoutCandidateItem.eventType,
+                        payoutCandidateItem.amount.sumLong()))
+                .from(payoutCandidateItem)
+                .where(payoutCandidateItem.orderId.in(orderIds),
+                        payoutCandidateItem.eventType.in(PayoutEventType.SALE_AMOUNT, PayoutEventType.SALE_FEE),
+                        pendingAdjustment())
+                .groupBy(payoutCandidateItem.orderId, payoutCandidateItem.eventType)
+                .fetch();
     }
 
     @Override
@@ -917,9 +1040,9 @@ public class PayoutQuerydslRepository implements PayoutQueryRepository {
     // 정렬은 후보 생성 시각 최신순 고정. 같은 시각에 생긴 후보가 여러 건(대금·수수료·배송비가 함께 생김)이라 id를 더해 페이지를 넘겨도 순서가 흔들리지 않게 함
     // 정산 ID는 payout_item과 LEFT JOIN으로 가져옴 (payout_item.candidate_id가 유니크라 후보 한 건이 여러 줄로 늘지 않음)
     @Override
-    public Page<CandidateRow> searchCandidates(Long sellerId, LocalDateTime from, LocalDateTime to,
+    public Page<CandidateRow> searchCandidates(Long orderId, Long sellerId, LocalDateTime from, LocalDateTime to,
                                                boolean unsettledOnly, boolean sellerShareOnly, Pageable pageable) {
-        BooleanBuilder condition = candidateSearchCondition(sellerId, from, to, unsettledOnly, sellerShareOnly);
+        BooleanBuilder condition = candidateSearchCondition(orderId, sellerId, from, to, unsettledOnly, sellerShareOnly);
         List<CandidateRow> content = queryFactory
                 .select(Projections.constructor(CandidateRow.class,
                         payoutCandidateItem.id,
@@ -1040,15 +1163,24 @@ public class PayoutQuerydslRepository implements PayoutQueryRepository {
     }
 
     // 정산후보 목록 조건. 기간은 정산 목록과 같은 규칙: from 포함, to 미포함
+    // 주문 ID(#723)는 uk_payout_candidate_items_order_id_ship_seller_id_adjustment_id(order_id로 시작)로 그 주문 몇 줄만 읽음
+    // from·to가 null이면 그쪽 경계를 걸지 않음 (주문 ID로 찾을 때만 null이 옴)
     // 미정산 판단은 정산 배치(unsettledInPeriod)와 같은 기준: payout_item에 같은 candidate_id가 없으면 미정산
-    private BooleanBuilder candidateSearchCondition(Long sellerId, LocalDateTime from, LocalDateTime to,
+    private BooleanBuilder candidateSearchCondition(Long orderId, Long sellerId, LocalDateTime from, LocalDateTime to,
                                                     boolean unsettledOnly, boolean sellerShareOnly) {
         BooleanBuilder condition = new BooleanBuilder();
+        if (orderId != null) {
+            condition.and(payoutCandidateItem.orderId.eq(orderId));
+        }
         if (sellerId != null) {
             condition.and(payoutCandidateItem.sellerId.eq(sellerId));
         }
-        condition.and(payoutCandidateItem.createdAt.goe(from));
-        condition.and(payoutCandidateItem.createdAt.lt(to));
+        if (from != null) {
+            condition.and(payoutCandidateItem.createdAt.goe(from));
+        }
+        if (to != null) {
+            condition.and(payoutCandidateItem.createdAt.lt(to));
+        }
         if (unsettledOnly) {
             condition.and(JPAExpressions.selectOne()
                     .from(payoutItem)
@@ -1214,11 +1346,38 @@ public class PayoutQuerydslRepository implements PayoutQueryRepository {
                 .and(JPAExpressions.selectOne()
                         .from(checkedResolution)
                         .join(checkedFailure).on(checkedFailure.id.eq(checkedResolution.failureId))
-                        .where(checkedFailure.orderId.eq(payoutCandidateItem.orderId),
-                                checkedFailure.reason.in(PayoutFailureReason.AMOUNT_MISMATCH, PayoutFailureReason.FEE_MISMATCH),
-                                checkedFailure.createdAt.loe(payoutCandidateItem.createdAt),
+                        .where(amountFailureBeforeAdjustment(checkedFailure),
                                 checkedResolution.createdAt.gt(payoutCandidateItem.createdAt))
                         .exists());
+    }
+
+    // 확인한 조정 조건 1·3번 앞쪽(#291 결정 4번): f가 같은 주문의 금액 불일치 실패이고 f.생성 시각 ≤ 조정.생성 시각
+    // 확인한 조정(confirmedAdjustment)과 해결 대기 조정(pendingAdjustment, #723)이 함께 씀
+    //   두 곳이 따로 쓰면 사유를 하나 더할 때 한쪽만 바뀌어, 화면의 대기 합계와 해결 뒤 실제 검사가 어긋남
+    // failure는 부르는 쪽 별칭 (바깥 쿼리의 payoutFailure와 섞이지 않게)
+    private BooleanExpression amountFailureBeforeAdjustment(QPayoutFailure failure) {
+        return failure.orderId.eq(payoutCandidateItem.orderId)
+                .and(failure.reason.in(ADJUSTMENT_CONFIRMING_REASONS))
+                .and(failure.createdAt.loe(payoutCandidateItem.createdAt));
+    }
+
+    // 해결 대기 조정 (#723): 지금 해결하면 확인한 조정이 될 조정
+    //   = 같은 주문에 해결 안 된 금액 불일치 실패 f가 있고 f ≤ 조정, 그리고 아직 확인한 조정이 아님
+    //   해결은 그 주문의 해결 안 된 실패를 모두 해결하고 해결 시각은 늘 조정 뒤라(r > 조정), 해결하면 위 f가 확인한 조정 조건을 채움
+    // 다음 정산 실행의 검사에 반드시 든다는 뜻은 아님: 실행 중(스냅샷 뒤)에 넣고 해결한 조정은 그 실행 검사에서 빠질 수 있음(checkedCandidate 주석)
+    private BooleanExpression pendingAdjustment() {
+        QPayoutFailure pendingFailure = new QPayoutFailure("pendingFailure");
+        QPayoutFailureResolution pendingFailureResolution = new QPayoutFailureResolution("pendingFailureResolution");
+        return payoutCandidateItem.adjustmentId.gt(PayoutCandidateItem.NO_ADMIN_ADJUSTMENT_ID)
+                .and(JPAExpressions.selectOne()
+                        .from(pendingFailure)
+                        .where(amountFailureBeforeAdjustment(pendingFailure),
+                                JPAExpressions.selectOne()
+                                        .from(pendingFailureResolution)
+                                        .where(pendingFailureResolution.failureId.eq(pendingFailure.id))
+                                        .notExists())
+                        .exists())
+                .and(confirmedAdjustment().not());
     }
 
     // 이번 스냅샷 후보들의 주문 ID (금액 검사 집계 쿼리의 IN 조건)
