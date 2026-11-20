@@ -15,6 +15,7 @@ import com.ok.payout.application.port.out.DepositCheckReviewRow;
 import com.ok.payout.application.port.out.PayoutItemRow;
 import com.ok.payout.application.port.out.PayoutResolutionRequestRow;
 import com.ok.payout.application.port.out.PayoutResolutionRow;
+import com.ok.payout.domain.PayoutAdjustmentCheckStatus;
 import com.ok.payout.domain.PayoutBlockedOrderCause;
 import com.ok.payout.domain.PayoutCandidateItem;
 import com.ok.payout.domain.PayoutOverchargeEvidence;
@@ -45,15 +46,35 @@ final class PayoutQueryResultMapper {
                 row.orderItemId(), row.sellerId(), row.amount(), row.candidateCreatedAt(), adjustment);
     }
 
+    // 조정 상태를 채우지 않는 조회(기간 조회, 판매자 조회)용
     static PayoutCandidateResult toCandidateResult(CandidateRow row) {
+        return toCandidateResult(row, null);
+    }
+
+    // 조정 상태(#791)는 관리자 주문 ID 조회만 채움. 상태가 없거나 평소 건이면 null
+    static PayoutCandidateResult toCandidateResult(CandidateRow row, PayoutAdjustmentCheckStatus adjustmentCheckStatus) {
         PayoutAdjustmentResult adjustment = null;
         // 평소 건은 adjustmentId가 0 (PayoutCandidateItem.NO_ADMIN_ADJUSTMENT_ID)
         if (row.adjustmentId() != PayoutCandidateItem.NO_ADMIN_ADJUSTMENT_ID) {
             adjustment = new PayoutAdjustmentResult(row.adjustmentId(), row.adminId(), row.reason());
         }
+        String status = adjustment == null || adjustmentCheckStatus == null ? null : adjustmentCheckStatus.name();
         return new PayoutCandidateResult(row.candidateId(), row.eventType().name(), row.orderId(), row.orderItemId(),
                 row.sellerId(), row.amount(), row.candidateCreatedAt(), row.payoutId() != null, row.payoutId(),
-                adjustment);
+                adjustment, status);
+    }
+
+    // 조정 줄 하나의 상태 (#791): 저장소가 고른 확인됨·해결 대기 ID에 없으면 검사 밖
+    // 검사 밖은 조건을 따로 쓰지 않고 나머지로 정함 (PayoutAdjustmentCheckStatus.UNCHECKED 주석)
+    //   해결 대기 조건이 "확인됨 아님"을 포함해 두 ID 목록은 겹치지 않지만, 겹쳐도 확인됨을 먼저 봄
+    static PayoutAdjustmentCheckStatus adjustmentCheckStatus(Long candidateId, Set<Long> confirmedIds, Set<Long> awaitingIds) {
+        if (confirmedIds.contains(candidateId)) {
+            return PayoutAdjustmentCheckStatus.CONFIRMED;
+        }
+        if (awaitingIds.contains(candidateId)) {
+            return PayoutAdjustmentCheckStatus.AWAITING_RESOLUTION;
+        }
+        return PayoutAdjustmentCheckStatus.UNCHECKED;
     }
 
     // 범주는 DB에 없고 사유가 들고 있어 여기서 꺼냄 (#391, PayoutFailureReason.category)
