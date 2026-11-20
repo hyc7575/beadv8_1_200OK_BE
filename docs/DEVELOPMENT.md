@@ -785,8 +785,67 @@ com.ok.wallet
 - 처리 뒤 결과를 Kafka로 보내다 잠깐 실패하면(Kafka가 다시 하면 될 수 있다고 알린 오류, 저장 확인 10초 초과) 1초부터 두 배씩, 최대 1분 간격으로 간격 합 30분까지 다시 시도합니다(#638). 시도마다 `[WALLET_SEND_RETRY]` WARN 로그를 남깁니다. 처리 기록이 있어 돈은 다시 움직이지 않고 처음 결과만 다시 보냅니다. 메시지 크기 초과처럼 다시 해도 안 되는 보내기 실패는 1·2·4초 규칙을 따릅니다.
 - 다시 시도하는 동안 같은 파티션의 뒤 메시지는 기다립니다. 최대 간격(1분)과 한 번 보내는 데 걸리는 시간의 합은 `max.poll.interval.ms`(기본 5분)보다 작아야 합니다. 한 번 보내기는 토픽 정보를 모르면(앱을 띄운 뒤 그 토픽에 처음 보낼 때 브로커가 없으면) `max.block.ms`(기본 1분)까지 멈춘 뒤 저장 확인을 10초까지 기다려, 합은 약 2분 10초입니다. 넘으면 소비자가 그룹에서 빠졌다 들어와 같은 메시지를 다시 처리합니다(`WalletKafkaConsumerConfigTest`가 막음).
 - 넘긴 메시지는 건너뛰지 않고 지갑 DB의 `wallet_message_failure`에 원문·가장 안쪽 원인과 함께 대기(`PENDING`)로 남기고 `[WALLET_MESSAGE_FAILED]` ERROR 로그를 한 번 남깁니다. 같은 메시지(토픽·파티션·오프셋)는 한 번만 남습니다. 기록마저 실패하면 오프셋을 옮기지 않아 같은 메시지를 다시 받습니다.
-- 지금은 사람이 기록을 보고 원인을 고친 뒤 처리하고 상태를 `RESOLVED`로 바꿉니다. 자동으로 다시 처리하는 기능은 아직 없습니다.
+- 지금은 사람이 기록을 보고 원인을 고친 뒤 처리하고 상태를 `RESOLVED`로 바꿉니다(아래 실패 기록 처리 순서). 자동으로 다시 처리하는 기능은 아직 없습니다.
+- 실패를 Kafka 실패 토픽(DLT)이 아니라 DB 표에 두는 이유는 SQL로 바로 찾아 처리 기록·원장과 이어 붙여 이미 풀린 기록을 거를 수 있고, Kafka 장애와 분리되기 때문입니다(결과를 Kafka로 보내다 실패한 경우는 DLT로 보내기도 실패함). 결정과 버린 대안은 ADR 579 후속(2026-11-20)에 있습니다.
 - 리스너는 값 검사를 서비스를 부르기 전에 끝냅니다. 받는 메시지의 값이 틀리면 `IllegalArgumentException`을 던집니다(다시 시도하지 않고 기록됨).
+
+**실패 기록 처리 순서**
+
+`[WALLET_MESSAGE_FAILED]` 로그가 남으면 지갑 스키마(`paldogotgan_wallet`)에서 아래 순서로 봅니다.
+
+1. 대기 중인 기록과 가장 안쪽 원인(`failure_reason`)을 봅니다.
+
+   ```sql
+   SELECT id, topic, message_key, failure_reason, created_at
+   FROM wallet_message_failure
+   WHERE status = 'PENDING'
+   ORDER BY id;
+   ```
+
+2. 기록마다 지갑이 이미 처리했는지 봅니다. 처리 기록이 같은 요청을 한 번만 반영하므로, 기록이 남은 뒤 같은 요청이 다시 와서 처리됐을 수 있습니다. `processed`가 1이면 지갑이 결과를 정했고(처리 기록 있음, 돈이 움직이지 않은 결과도 포함), 0이면 아직이며, NULL이면 원문이 JSON이 아니거나 처리 기록이 없는 토픽(입금 확인)이거나 이 SQL에 없는 토픽입니다. 지갑이 받는 토픽(`WalletKafkaTopics`)을 더하거나 이름을 바꾸면 이 SQL도 함께 고칩니다.
+
+   ```sql
+   SELECT f.id, f.topic, f.message_key,
+          CASE
+              WHEN NOT JSON_VALID(f.payload) THEN NULL
+              WHEN f.topic IN ('order.order-created.v1', 'order.order-payment-expire-requested.v1') THEN EXISTS (
+                  SELECT 1 FROM wallet_order_payment p
+                  WHERE p.order_id = JSON_UNQUOTE(JSON_EXTRACT(f.payload, '$.orderId')))
+              WHEN f.topic = 'refund.refund-approved.v1' THEN EXISTS (
+                  SELECT 1 FROM wallet_order_refund r
+                  WHERE r.refund_id = JSON_UNQUOTE(JSON_EXTRACT(f.payload, '$.refundId')))
+              WHEN f.topic = 'refund.refund-wallet-revert-requested.v1' THEN EXISTS (
+                  SELECT 1 FROM wallet_order_refund_revert v
+                  WHERE v.refund_id = JSON_UNQUOTE(JSON_EXTRACT(f.payload, '$.refundId')))
+              WHEN f.topic = 'payout.seller-payout-created.v1' THEN EXISTS (
+                  SELECT 1 FROM seller_wallet_ledger l
+                  WHERE l.reference_key = CONCAT('PAYOUT:', JSON_UNQUOTE(JSON_EXTRACT(f.payload, '$.payoutId'))))
+          END AS processed
+   FROM wallet_message_failure f
+   WHERE f.status = 'PENDING'
+   ORDER BY f.id;
+   ```
+
+   | 토픽 | `processed` = 1 | `processed` = 0 |
+   |---|---|---|
+   | 주문 생성, 결제 만료 요청 | 결과가 정해짐(결제 완료·잔액 부족·만료). 주문이 결과를 받을 때까지 5분마다 만료를 다시 요청하고 지갑은 처음 결과를 다시 보내므로(#656), 주문이 결과를 받았으면 해결 | 주문이 30분 뒤 만료를 요청하면 만료로 기록되고 결제 실패가 나갑니다(#656). 그 뒤 다시 확인 |
+   | 환불 반환, 환불 되돌리기 | 결과가 정해짐(반환: 돌려줌·거절, 되돌리기: 다시 가져옴·잔액 부족). 환불은 결과를 받을 때까지 같은 요청을 5분마다(24시간까지) 다시 보내고 지갑은 처음 결과를 다시 보내므로(#577), 환불이 결과를 받았으면 해결 | 원인을 고치면 환불이 다시 보내는 요청으로 처리됩니다. 지갑 결과를 30분 넘게 기다린 환불은 환불의 멈춘 환불 찾기(1시간마다)가 사람에게 알립니다(#577) |
+   | 정산금 확정 | 입금됨(원장은 입금했을 때만 남고, 보내는 결과 없음). 해결 | 정산이 매일 대사에서 입금이 없다는 답을 받으면 같은 정산을 다시 보내 입금됩니다(지갑은 `payoutId`로 한 번만 입금, #619). 원인을 고친 뒤 다음 대사를 기다립니다 |
+   | 정산금 입금 확인 (`NULL`) | - | 읽기만 하는 요청이라 지갑 돈은 그대로입니다. 정산이 답 없는 정산을 다음 날 다시 묻습니다 |
+
+   원문이 JSON이 아닌 기록(`NULL`)은 보내는 모듈 담당과 원문을 확인합니다.
+
+3. 처리가 끝난 기록만 해결로 바꿉니다. 운영 DB에서 직접 바꾸므로 같은 조건으로 먼저 조회해 대상 건수를 확인합니다.
+
+   ```sql
+   SELECT id, topic, message_key
+   FROM wallet_message_failure
+   WHERE id IN (/* 해결한 id */) AND status = 'PENDING';
+
+   UPDATE wallet_message_failure
+   SET status = 'RESOLVED', updated_at = NOW(6)
+   WHERE id IN (/* 해결한 id */) AND status = 'PENDING';
+   ```
 
 **환불 반환**
 
